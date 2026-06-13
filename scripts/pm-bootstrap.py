@@ -255,7 +255,7 @@ phases:
 
 
 def copy_skills(dry_run: bool) -> tuple[int, int]:
-    """Copy pm-workflow-* skills from pm-design to project .opencode/skills/. Returns (copied, skipped)."""
+    """Copy pm-workflow-* skills from pm-devkit to project .opencode/skills/. Returns (copied, skipped)."""
     if not SKILLS_DIR.exists():
         return 0, 0
 
@@ -280,7 +280,7 @@ def copy_skills(dry_run: bool) -> tuple[int, int]:
 
 
 def copy_runtime_scripts(dry_run: bool) -> tuple[int, int]:
-    """Copy runtime scripts (session-worktree-mgr.py, etc.) from pm-design to project scripts/. Returns (copied, skipped)."""
+    """Copy runtime scripts (session-worktree-mgr.py, etc.) from pm-devkit to project scripts/. Returns (copied, skipped)."""
     if not RUNTIME_DIR.exists():
         return 0, 0
 
@@ -307,7 +307,7 @@ def copy_runtime_scripts(dry_run: bool) -> tuple[int, int]:
 
 
 def copy_plugins(dry_run: bool) -> tuple[int, int]:
-    """Copy plugins from pm-design to project .opencode/plugins/ and .pm/. Returns (copied, skipped)."""
+    """Copy plugins from pm-devkit to project .opencode/plugins/ and .pm/. Returns (copied, skipped)."""
     if not PLUGINS_DIR.exists():
         return 0, 0
 
@@ -456,17 +456,17 @@ def main() -> None:
     elif opencode_tgt.exists():
         skipped += 1
 
-    # Copy skills from pm-design
+    # Copy skills from pm-devkit
     sc, ss = copy_skills(args.dry_run)
     generated += sc
     skipped += ss
 
-    # Copy runtime scripts from pm-design
+    # Copy runtime scripts from pm-devkit
     rc, rs = copy_runtime_scripts(args.dry_run)
     generated += rc
     skipped += rs
 
-    # Copy plugins from pm-design
+    # Copy plugins from pm-devkit
     pc, ps = copy_plugins(args.dry_run)
     generated += pc
     skipped += ps
