@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "targetAgent": "pm",
+  "sessionInfoFile": "pm-session-info.json",
+  "sessionGuardForceTakeover": false,
+  "logFile": "pm-guardian.jsonl",
+  "logLevel": "info",
+  "logToOpenCodeApp": false,
+  "debugDump": false,
+  "runtimeLogConfigPollIntervalMs": 10000,
+  "instructFiles": [
+    "persona.md",
+    "session_worktree_mgmt.md",
+    "operational_conventions.md"
+  ]
+}
