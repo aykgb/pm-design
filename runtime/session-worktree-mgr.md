@@ -83,7 +83,19 @@ python3 scripts/session-worktree-mgr.py pool prepare --branch feat_xxx
 python3 scripts/session-worktree-mgr.py pool dispatch wt_1 Daedalus --task "..." --yes
 ```
 
-`dispatch --yes` 会自动启动 idle-watch；agent 从 busy 回到 idle 后会自动通知 PM session。正常情况下不用主动轮询 agent 结果。
+`dispatch --yes` 会自动启动 idle-watch；agent 从 busy 回到 idle 后会自动通知 PM session。
+
+**3a. Stuck session 恢复：**
+
+```bash
+# 自动恢复（session busy > 15min 自动 hard-delete + 重建）
+python3 scripts/session-worktree-mgr.py pool dispatch wt_1 Daedalus --task "..." --yes
+
+# 强制恢复（不限 staleness，直接 hard-delete + 重建）
+python3 scripts/session-worktree-mgr.py pool dispatch wt_1 Daedalus --task "..." --force --yes
+```
+
+正常 idle 复用旧会话；stuck > 15min 自动恢复；新鲜 busy 拒绝并提示用 `--force`。
 
 **4. 释放 worktree：**
 
@@ -158,15 +170,17 @@ python3 scripts/session-worktree-mgr.py session last ses_xxx
 | no idle initialized worktree | 可执行 `pool status --verify` 查看状态；需要初始化/修复时先向用户报告，再建议 `pool init` 或 `pool repair wt_N` |
 | missing/stale session id | 可建议 `pool repair wt_N`；是否执行由用户确认 |
 | worktree is dirty | 不主动丢弃修改；先报告 dirty 状态，用户确认后才可执行 `pool release wt_N --force` |
-| session busy/streaming | 可执行 `session status ses_xxx` 查看状态；等待、换 session 或重新派发前需判断风险 |
+| session busy/streaming > 15min | dispatch 自动 hard-delete + 重建恢复；无需人工干预 |
+| session busy/streaming < 15min | 正常工作中，等待；确认为卡死时用 `--force` 强制恢复 |
 | 未收到 idle-watch 通知 | 可 fallback 执行 `session status ses_xxx`，必要时 `session last ses_xxx` |
 
 ## 操作边界
 
 * PM 可以主动执行只读检查命令，例如 `overview`、`pool status --verify`、`session status`、`session last`。
 * PM 可以按任务流程执行 `pool prepare`、`pool dispatch ... --yes`。
+* Stuck session（busy > 15min）时 dispatch 自动 hard-delete 恢复；`--force` 跳过 staleness 检查。
 * PM 不主动启动、停止、重启服务。
-* PM 不主动执行破坏性命令，例如 `pool release --force`、`session delete --hard`、批量 delete。
+* PM 不主动执行破坏性命令，例如 `pool release --force`、`session delete --hard`、批量 delete。`dispatch --force` 的自动 hard-delete 除外。
 * 遇到服务异常、dirty worktree、缺失 session、需要 repair/init 的情况，先向用户报告原因和建议命令。
 * 只有用户明确确认后，才执行修复类或破坏性命令。
 
