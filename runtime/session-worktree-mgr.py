@@ -520,10 +520,18 @@ def sessions(config: Config, *, directory: Path | None = None, search: str | Non
 
 
 def get_session_by_id(config: Config, session_id: str, directory: Path | None = None) -> dict[str, Any] | None:
-    for session in sessions(config, directory=directory, limit=500):
-        if session.get("id") == session_id:
-            return session
-    return None
+    """Fetch a single session by ID (direct GET, not list scan)."""
+    try:
+        data = http_json("GET", f"{config.op_server}/session/{urllib.parse.quote(session_id)}")
+    except SystemExit:
+        return None
+    if not isinstance(data, dict):
+        return None
+    if directory is not None:
+        sdir = data.get("directory")
+        if not sdir or normalize_path(str(sdir)) != normalize_path(directory):
+            return None
+    return data
 
 
 def find_session_by_title(config: Config, title: str, directory: Path) -> dict[str, Any] | None:
@@ -865,7 +873,8 @@ def ensure_session(
         item = get_session_by_id(config, state_sid, directory=wt_path)
         if item:
             if recreate_existing:
-                eprint(f"old state session archived (not deleted): {state_sid}")
+                delete_session(config, state_sid, hard=False)
+                eprint(f"old state session archived: {state_sid}")
             elif recreate_stale and is_session_stale(item, max_age_ms):
                 eprint(f"stale state session archived (> {max_age_ms}ms): {state_sid}")
                 delete_session(config, state_sid)
@@ -883,7 +892,8 @@ def ensure_session(
         item = None
     if item:
         if recreate_existing:
-            eprint(f"session archived by title (not deleted): {item.get('id')}")
+            delete_session(config, item["id"], hard=False)
+            eprint(f"session archived by title: {item.get('id')}")
         elif recreate_stale and is_session_stale(item, max_age_ms):
             eprint(f"session archived by title (> {max_age_ms}ms): {item.get('id')}")
             delete_session(config, item["id"])
@@ -1526,8 +1536,8 @@ def cmd_dispatch(args: argparse.Namespace, config: Config) -> None:
     session_status = "unknown"
     if isinstance(status_map, dict):
         session_status = str(status_map.get(sid, "unknown"))
-    if args.require_no_busy and session_status not in ("idle", "unknown"):
-        fail(f"session {sid} not dispatchable: {session_status} (--require-no-busy)")
+    if args.require_no_busy and session_status != "idle":
+        fail(f"session {sid} not dispatchable: {session_status} (--require-no-busy requires idle)")
     if session_status in ("busy", "streaming"):
         force_recover = getattr(args, "force", False)
         if not force_recover:
@@ -1542,6 +1552,7 @@ def cmd_dispatch(args: argparse.Namespace, config: Config) -> None:
                 # Main session: hard-delete old + create new + dispatch
                 new_ses = create_session(config, "main", wt_path, agent)
                 sid = new_ses["id"]
+                ses = new_ses  # update reference for downstream persist_main_session
                 persist_main_session(config, agent, new_ses)
             else:
                 update_state(config, wt_id, {f"{agent}_session_id": ""})
@@ -3761,6 +3772,7 @@ def cmd_session_dispatch(args: argparse.Namespace, config: Config) -> None:
         agent=args.agent,
         task=args.task,
         yes=args.yes,
+        force=args.force,
         notify_session=args.notify_session,
         require_no_busy=args.require_no_busy,
         max_poll_seconds=args.max_poll_seconds,
