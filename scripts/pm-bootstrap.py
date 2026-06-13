@@ -2,9 +2,10 @@
 """PM System Bootstrap — 从 .pm/design/templates/ 生成 PM 域文件。
 
 用法：
-    python scripts/pm-bootstrap.py                    # 交互式
-    python scripts/pm-bootstrap.py --from docs/       # 从项目文档推断配置
-    python scripts/pm-bootstrap.py --dry-run          # 预览，不写入
+    python scripts/pm-bootstrap.py                              # 交互式（默认读 pm.config.yaml）
+    python scripts/pm-bootstrap.py --from docs/                 # 从项目文档推断配置
+    python scripts/pm-bootstrap.py --config ~/.pm/myconf.yaml   # 自定义配置路径
+    python scripts/pm-bootstrap.py --dry-run                    # 预览，不写入
 
 前提：.pm/design/ 已作为 git submodule 就位。
 """
@@ -249,8 +250,17 @@ phases:
 def main() -> None:
     parser = argparse.ArgumentParser(description="PM System Bootstrap")
     parser.add_argument("--from", dest="from_dir", default=None, help="从项目文档推断配置")
+    parser.add_argument("--config", dest="config", default=None, help="自定义 pm.config.yaml 路径（默认：项目根目录）")
     parser.add_argument("--dry-run", action="store_true", help="预览，不写入文件")
     args = parser.parse_args()
+
+    # 支持自定义配置文件路径
+    if args.config:
+        global CONFIG_FILE
+        CONFIG_FILE = Path(args.config).expanduser().resolve()
+        if not CONFIG_FILE.parent.exists():
+            print(f"❌ 配置目录不存在: {CONFIG_FILE.parent}")
+            sys.exit(1)
 
     if not DESIGN_DIR.exists():
         print("❌ .pm/design/ 不存在。请先添加 submodule：")
@@ -261,6 +271,7 @@ def main() -> None:
     config = infer_from_plan() if args.from_dir else read_config()
 
     print(f"\n🔧 PM Bootstrap — {config['project_name']}")
+    print(f"   配置: {CONFIG_FILE}")
     print(f"   Agent: dev={config['dev_agent']} review={config['review_agent']} qa={config['qa_agent']}")
     if args.dry_run:
         print("   (dry-run 模式，不写入文件)\n")
