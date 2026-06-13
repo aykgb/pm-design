@@ -601,6 +601,7 @@ def delete_session(config: Config, session_id: str, *, hard: bool = False) -> No
 
 
 STALE_SESSION_MS_DEFAULT = 24 * 60 * 60 * 1000  # 1 day
+STALE_DISPATCH_MS = 15 * 60 * 1000  # 15 min — auto-recover stuck dispatch sessions
 MAX_MAIN_SESSION_CONTEXT = 200_000  # rebuild main agent session when context exceeds this
 
 # Default recent window for `cmd_overview` and `rewatch_all_sessions`.
@@ -613,7 +614,7 @@ _OVERVIEW_RECENT_DEFAULT_MS = _OVERVIEW_RECENT_DEFAULT_SECONDS * 1000
 # Overview/sidecar should not scan an unbounded number of historical PM
 # conversations from <pool_dir>/.state/sessions/<pm_session_id>/main.state.
 # Keep the current PM session (if present) plus the newest historical PM states.
-_PM_STATE_HISTORY_LIMIT_DEFAULT = 2
+_PM_STATE_HISTORY_LIMIT_DEFAULT = 1
 
 
 def is_session_stale(session: dict[str, Any], max_age_ms: int = STALE_SESSION_MS_DEFAULT) -> bool:
@@ -1526,7 +1527,31 @@ def cmd_dispatch(args: argparse.Namespace, config: Config) -> None:
     if args.require_no_busy and session_status not in ("idle", "unknown"):
         fail(f"session {sid} not dispatchable: {session_status} (--require-no-busy)")
     if session_status in ("busy", "streaming"):
-        fail(f"session {sid} is not dispatchable: {session_status}")
+        force_recover = getattr(args, "force", False)
+        if args.session:
+            # --session dispatch doesn't support forced recovery (named session)
+            if force_recover:
+                fail("--force not supported for --session dispatch; use pool dispatch wt_N Agent --force instead")
+            fail(f"session {sid} is not dispatchable: {session_status}")
+        if not force_recover:
+            # Auto-recover if session has been stuck > 15 min
+            ses = get_session_by_id(config, sid, directory=wt_path)
+            if ses and is_session_stale(ses, max_age_ms=STALE_DISPATCH_MS):
+                force_recover = True
+                eprint(f"auto-recovering stuck session {sid} (busy > {STALE_DISPATCH_MS // 60000}min)")
+        if force_recover:
+            delete_session(config, sid, hard=True)
+            update_state(config, wt_id, {f"{agent}_session_id": ""})
+            ses = ensure_session(config, wt_id, wt_path, agent, recreate_existing=True)
+            sid = ses["id"]
+            persist_session(config, wt_id, agent, ses)
+            watch_session(config, sid)
+            status_map = http_json("GET", f"{config.sidecar}/status")
+            session_status = "unknown"
+            if isinstance(status_map, dict):
+                session_status = str(status_map.get(sid, "unknown"))
+        else:
+            fail(f"session {sid} is not dispatchable: {session_status} (use --force to hard-delete stuck session)")
     provider_id, model_id, variant = opencode_model(config, agent)
     prompt = render_prompt(wt_path, args.task.strip())
     body: dict[str, Any] = {
@@ -3788,6 +3813,7 @@ def _add_dispatch_options(parser: argparse.ArgumentParser, *, allow_session: boo
         parser.add_argument("--session", default=None, help=argparse.SUPPRESS)
     parser.add_argument("--task", required=True, help="Task text to send. Without --yes this only previews the prompt.")
     parser.add_argument("--yes", action="store_true", help="Actually send the prompt. Without this flag, print a preview only.")
+    parser.add_argument("--force", action="store_true", help="Hard-delete stuck session and create a fresh one before dispatching.")
     parser.add_argument(
         "--notify-session",
         default=env("PM_SESSION_ID", ""),
