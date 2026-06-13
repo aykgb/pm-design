@@ -52,6 +52,7 @@ python3 scripts/session-worktree-mgr.py pool init --size 10
 python3 scripts/session-worktree-mgr.py pool repair wt_1
 python3 scripts/session-worktree-mgr.py pool prepare --branch feat_xxx
 python3 scripts/session-worktree-mgr.py pool dispatch wt_1 Daedalus --task "..." --yes
+python3 scripts/session-worktree-mgr.py pool continue wt_1 Daedalus --yes
 python3 scripts/session-worktree-mgr.py pool release wt_1
 ```
 
@@ -85,17 +86,38 @@ python3 scripts/session-worktree-mgr.py pool dispatch wt_1 Daedalus --task "..."
 
 `dispatch --yes` 会自动启动 idle-watch；agent 从 busy 回到 idle 后会自动通知 PM session。
 
-**3a. Stuck session 恢复：**
+**3a. Stuck session 续接（pool continue）：**
 
 ```bash
-# 自动恢复（session busy > 15min 自动 hard-delete + 重建）
+# 保留已有分支 + commits → 新 session → 自动续接 prompt（含 git log 快照）
+python3 scripts/session-worktree-mgr.py pool continue wt_1 Daedalus --yes
+```
+
+适用：session stuck 但 agent 已部分完成并推了 commits。与 `--force` 重写不同，`continue` 保留分支和已有工作，仅创建全新 session 续接。
+
+```bash
+# 预览续接 prompt（不实际派发）
+python3 scripts/session-worktree-mgr.py pool continue wt_1 Daedalus --task "补充说明..." 
+```
+
+**3b. Stuck session 强制恢复（--force）：**
+
+```bash
+# 自动恢复（session busy > 15min 且 time.updated 无刷新 → 自动 hard-delete + 重建）
 python3 scripts/session-worktree-mgr.py pool dispatch wt_1 Daedalus --task "..." --yes
 
-# 强制恢复（不限 staleness，直接 hard-delete + 重建）
+# 强制恢复（不限 staleness，直接 hard-delete + 重建，丢弃已有工作）
 python3 scripts/session-worktree-mgr.py pool dispatch wt_1 Daedalus --task "..." --force --yes
 ```
 
-正常 idle 复用旧会话；stuck > 15min 自动恢复；新鲜 busy 拒绝并提示用 `--force`。
+区别：
+
+| 路径 | 场景 | 行为 | 分支 |
+|------|------|------|------|
+| 正常 dispatch | session idle | 复用旧 session | 不改变 |
+| `continue` | stuck 但有 commits | 新 session + 续接 prompt | **保留**已有 branch |
+| stale 自动恢复 | stuck > 15min | hard-delete + 重建 | 保留（同 wt，不 checkout 新 branch） |
+| `--force` | 彻底卡死、无产出 | hard-delete + 重建 | 保留（同 wt） |
 
 **4. 释放 worktree：**
 
@@ -170,17 +192,18 @@ python3 scripts/session-worktree-mgr.py session last ses_xxx
 | no idle initialized worktree | 可执行 `pool status --verify` 查看状态；需要初始化/修复时先向用户报告，再建议 `pool init` 或 `pool repair wt_N` |
 | missing/stale session id | 可建议 `pool repair wt_N`；是否执行由用户确认 |
 | worktree is dirty | 不主动丢弃修改；先报告 dirty 状态，用户确认后才可执行 `pool release wt_N --force` |
-| session busy/streaming > 15min | dispatch 自动 hard-delete + 重建恢复；无需人工干预 |
-| session busy/streaming < 15min | 正常工作中，等待；确认为卡死时用 `--force` 强制恢复 |
+| stuck-notify（idle-watch 通知） | 消息含 target / wt / agent / stale 时长。有 commits → `pool continue`；无产出 → `--force` |
+| session busy/streaming < 15min | 正常工作中，等待；确认为卡死时用 `continue` 或 `--force` |
 | 未收到 idle-watch 通知 | 可 fallback 执行 `session status ses_xxx`，必要时 `session last ses_xxx` |
 
 ## 操作边界
 
 * PM 可以主动执行只读检查命令，例如 `overview`、`pool status --verify`、`session status`、`session last`。
-* PM 可以按任务流程执行 `pool prepare`、`pool dispatch ... --yes`。
-* Stuck session（busy > 15min）时 dispatch 自动 hard-delete 恢复；`--force` 跳过 staleness 检查。
+* PM 可以按任务流程执行 `pool prepare`、`pool dispatch ... --yes`、`pool continue`。
+* Stuck session（busy > 15min 且 time.updated 无刷新）→ idle-watch 发送 stuck-notify（含 wt/agent 上下文）。PM 收到后判断：有 commits → `pool continue`；无产出 → `dispatch --force`。
+* `pool continue` 保留已有 branch 和 commits，创建全新 session + 自动续接 prompt（含 `git log --oneline -10`）；无 `--yes` 时仅预览，不修改状态。
 * PM 不主动启动、停止、重启服务。
-* PM 不主动执行破坏性命令，例如 `pool release --force`、`session delete --hard`、批量 delete。`dispatch --force` 的自动 hard-delete 除外。
+* PM 不主动执行破坏性命令，例如 `pool release --force`、`session delete --hard`、批量 delete。`dispatch --force` / `pool continue` 的自动 hard-delete 除外。
 * 遇到服务异常、dirty worktree、缺失 session、需要 repair/init 的情况，先向用户报告原因和建议命令。
 * 只有用户明确确认后，才执行修复类或破坏性命令。
 
@@ -191,7 +214,11 @@ python3 scripts/session-worktree-mgr.py session last ses_xxx
 * worktree 生命周期一律用 `pool`。
 * 正常任务默认直接派发 `--yes`。
 * 高风险任务才先预览派发。
+* stuck session 有 commits → `pool continue`；无产出 → `dispatch --force`。
 * dispatch 会自动 idle-watch；主动查看结果只作为 fallback。
+* stuck-notify 消息含 wt / agent / stale 时长，无需手动查 overview。
+* overview 全局一次 `/session?limit=2000` HTTP 调用，非 per-wt 多次调用。
 * 不确定命令时先执行 `python3 scripts/session-worktree-mgr.py -h` 或对应子命令 `-h`。
 * 不要绕过 `pool prepare -> pool dispatch -> pool release` 生命周期。
+* `pool continue` 在已有 wt 上直接派发新 session，不走 `prepare`（branch 已存在）。
 * 修改前先确认 worktree、branch、session id 与 agent 对应关系。
