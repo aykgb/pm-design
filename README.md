@@ -28,6 +28,8 @@
 python3 scripts/session-worktree-mgr.py overview
 ```
 
+![overview 截图](diagrams/overview.png)
+
 输出内容：
 
 - **服务健康**：OpenCode Server + Session Sidecar 是否 healthy
