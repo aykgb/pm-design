@@ -22,6 +22,7 @@ TEMPLATES_PM = DESIGN_DIR / "templates" / "pm"
 TEMPLATES_AGENTS = DESIGN_DIR / "templates" / "agents"
 SKILLS_DIR = DESIGN_DIR / "skills"
 RUNTIME_DIR = DESIGN_DIR / "runtime"
+PLUGINS_DIR = DESIGN_DIR / "plugins"
 CONFIG_FILE = PROJECT_ROOT / "pm.config.yaml"
 
 # ——— placeholder substitution ———
@@ -305,6 +306,42 @@ def copy_runtime_scripts(dry_run: bool) -> tuple[int, int]:
     return copied, skipped
 
 
+def copy_plugins(dry_run: bool) -> tuple[int, int]:
+    """Copy plugins from pm-design to project .opencode/plugins/ and .pm/. Returns (copied, skipped)."""
+    if not PLUGINS_DIR.exists():
+        return 0, 0
+
+    copied, skipped = 0, 0
+    plugins_target = PROJECT_ROOT / ".opencode" / "plugins"
+    pm_target = PROJECT_ROOT / ".pm"
+
+    for src in PLUGINS_DIR.iterdir():
+        if not src.is_file() or src.name.startswith("."):
+            continue
+
+        # .js files → .opencode/plugins/, .conf.json → .pm/
+        if src.suffix == ".js":
+            dst = plugins_target / src.name
+        elif src.suffix == ".json":
+            dst = pm_target / src.name
+        else:
+            continue
+
+        if dst.exists():
+            skipped += 1
+            continue
+        if dry_run:
+            print(f"   📄 将复制 plugin: {src.name}")
+        else:
+            import shutil
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, dst)
+            print(f"   ✅ 复制 plugin: {src.name}")
+        copied += 1
+
+    return copied, skipped
+
+
 def _copy_dir(src: Path, dst: Path) -> None:
     """Recursively copy a directory, creating parent dirs."""
     import shutil
@@ -428,6 +465,11 @@ def main() -> None:
     rc, rs = copy_runtime_scripts(args.dry_run)
     generated += rc
     skipped += rs
+
+    # Copy plugins from pm-design
+    pc, ps = copy_plugins(args.dry_run)
+    generated += pc
+    skipped += ps
 
     # Ensure directories
     for d in [".pm/chats", ".pm/reflections", "docs/task_specs"]:
