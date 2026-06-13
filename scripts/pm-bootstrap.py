@@ -20,6 +20,8 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 DESIGN_DIR = Path(__file__).resolve().parents[1]
 TEMPLATES_PM = DESIGN_DIR / "templates" / "pm"
 TEMPLATES_AGENTS = DESIGN_DIR / "templates" / "agents"
+SKILLS_DIR = DESIGN_DIR / "skills"
+RUNTIME_DIR = DESIGN_DIR / "runtime"
 CONFIG_FILE = PROJECT_ROOT / "pm.config.yaml"
 
 # ——— placeholder substitution ———
@@ -244,6 +246,65 @@ phases:
     return True
 
 
+def copy_skills(dry_run: bool) -> tuple[int, int]:
+    """Copy pm-workflow-* skills from pm-design to project .opencode/skills/. Returns (copied, skipped)."""
+    if not SKILLS_DIR.exists():
+        return 0, 0
+
+    copied, skipped = 0, 0
+    target_base = PROJECT_ROOT / ".opencode" / "skills"
+
+    for src in sorted(SKILLS_DIR.iterdir()):
+        if not src.is_dir():
+            continue
+        dst = target_base / src.name
+        if dst.exists():
+            skipped += 1
+            continue
+        if dry_run:
+            print(f"   📁 将复制 skill: {src.name}")
+        else:
+            _copy_dir(src, dst)
+            print(f"   ✅ 复制 skill: {src.name}")
+        copied += 1
+
+    return copied, skipped
+
+
+def copy_runtime_scripts(dry_run: bool) -> tuple[int, int]:
+    """Copy runtime scripts (session-worktree-mgr.py, etc.) from pm-design to project scripts/. Returns (copied, skipped)."""
+    if not RUNTIME_DIR.exists():
+        return 0, 0
+
+    copied, skipped = 0, 0
+    target_base = PROJECT_ROOT / "scripts"
+
+    for src in RUNTIME_DIR.iterdir():
+        if not src.is_file() or src.name.startswith("."):
+            continue
+        dst = target_base / src.name
+        if dst.exists():
+            skipped += 1
+            continue
+        if dry_run:
+            print(f"   📄 将复制 runtime: {src.name}")
+        else:
+            target_base.mkdir(parents=True, exist_ok=True)
+            import shutil
+            shutil.copy2(src, dst)
+            print(f"   ✅ 复制 runtime: {src.name}")
+        copied += 1
+
+    return copied, skipped
+
+
+def _copy_dir(src: Path, dst: Path) -> None:
+    """Recursively copy a directory, creating parent dirs."""
+    import shutil
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(src, dst)
+
+
 # ——— main ———
 
 
@@ -290,6 +351,14 @@ def main() -> None:
         elif tgt.exists():
             skipped += 1
 
+    # CLAUDE.md（项目根目录）
+    claude_tpl = TEMPLATES_PM / "CLAUDE.md"
+    claude_tgt = PROJECT_ROOT / "CLAUDE.md"
+    if generate_file(claude_tpl, claude_tgt, config, args.dry_run):
+        generated += 1
+    elif claude_tgt.exists():
+        skipped += 1
+
     # Agent templates
     for key, tpl_name in [
         ("dev_agent", "dev.agent.md"),
@@ -314,6 +383,16 @@ def main() -> None:
         else:
             if fn(args.dry_run):
                 generated += 1
+
+    # Copy skills from pm-design
+    sc, ss = copy_skills(args.dry_run)
+    generated += sc
+    skipped += ss
+
+    # Copy runtime scripts from pm-design
+    rc, rs = copy_runtime_scripts(args.dry_run)
+    generated += rc
+    skipped += rs
 
     # Ensure directories
     for d in [".pm/chats", ".pm/reflections", "docs/task_specs"]:

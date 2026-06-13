@@ -45,10 +45,22 @@ Last updated: 2026-06-13
 
 | 目录 | 内容 |
 |------|------|
-| [specs/](specs/) | 6 个子系统设计文档 |
-| [templates/pm/](templates/pm/) | `project_memory.md` / `operational_conventions.md` / `persona.md` / `pm.config.yaml` 骨架 |
+| [templates/pm/](templates/pm/) | `CLAUDE.md` / `project_memory.md` / `operational_conventions.md` / `persona.md` / `pm.config.yaml` 骨架 |
 | [templates/agents/](templates/agents/) | 开发 Agent / 审查 Agent / QA Agent 定义骨架（含 `<agent-name>` 占位符） |
-| [adr/](adr/) | 架构决策记录 |
+
+## 运行时
+
+| 目录 | 内容 |
+|------|------|
+| [skills/](skills/) | 8 个 `pm-workflow-*` skill（PM 工作流引擎，bootstrap 时复制到项目 `.opencode/skills/`） |
+| [runtime/](runtime/) | `session-worktree-mgr.py` / `session-status-server.mjs`（bootstrap 时复制到项目 `scripts/`） |
+| [scripts/](scripts/) | `pm-bootstrap.py`（bootstrap 入口） |
+
+## 决策记录
+
+| 目录 | 内容 |
+|------|------|
+| [adr/](adr/) | ADR-001 bootstrap-vs-self-healing / ADR-002 batch-size-threshold |
 
 ## 两种接入路径
 
