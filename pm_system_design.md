@@ -45,8 +45,10 @@ Last updated: 2026-06-13
 
 | 目录 | 内容 |
 |------|------|
+| [specs/](specs/) | 6 个子系统设计文档 |
 | [templates/pm/](templates/pm/) | `project_memory.md` / `operational_conventions.md` / `persona.md` / `pm.config.yaml` 骨架 |
 | [templates/agents/](templates/agents/) | 开发 Agent / 审查 Agent / QA Agent 定义骨架（含 `<agent-name>` 占位符） |
+| [adr/](adr/) | 架构决策记录 |
 
 ## 两种接入路径
 
