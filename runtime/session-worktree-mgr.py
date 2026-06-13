@@ -1618,6 +1618,8 @@ def cmd_dispatch(args: argparse.Namespace, config: Config) -> None:
             sid,
             notify_sid,
             wt_path,
+            wt_id=wt_id if not args.session else "main",
+            agent=agent,
             max_poll_seconds=args.max_poll_seconds,
             started_at_ms=dispatch_started_at_ms,
         )
@@ -3199,6 +3201,8 @@ def _spawn_dispatch_idle_watch(
     notify_sid: str,
     wt_path: Path,
     *,
+    wt_id: str = "",
+    agent: str = "",
     max_poll_seconds: int = 0,
     started_at_ms: int = 0,
 ) -> None:
@@ -3240,6 +3244,10 @@ def _spawn_dispatch_idle_watch(
         "--directory",
         str(wt_path),
     ]
+    if wt_id:
+        cmd.extend(["--wt-id", wt_id])
+    if agent:
+        cmd.extend(["--agent", agent])
     if max_poll_seconds > 0:
         cmd.extend(["--max-poll-seconds", str(int(max_poll_seconds))])
     if started_at_ms > 0:
@@ -3355,7 +3363,16 @@ def cmd_idle_watch(args: argparse.Namespace, config: Config) -> None:
                     updated_ms = int((ses_data.get("time") or {}).get("updated", 0))
                     if updated_ms > 0 and (time.time() * 1000 - updated_ms) > STALE_DISPATCH_MS:
                         stuck_notified = True
-                        msg = f"[stuck-notify] target={target} stuck in {current_status} > {STALE_DISPATCH_MS // 60000}min (last updated {time.time() * 1000 - updated_ms:.0f}ms ago)"
+                        ctx_parts = [f"target={target}"]
+                        wt_id = getattr(args, "wt_id", "")
+                        agent = getattr(args, "agent", "")
+                        if wt_id:
+                            ctx_parts.append(f"wt={wt_id}")
+                        if agent:
+                            ctx_parts.append(f"agent={agent}")
+                        ctx_parts.append(f"stale>{STALE_DISPATCH_MS // 60000}min")
+                        ctx_parts.append(f"(last updated {time.time() * 1000 - updated_ms:.0f}ms ago)")
+                        msg = f"[stuck-notify] {' '.join(ctx_parts)}"
                         eprint(msg)
                         _idle_prompt_async(config, notify, msg, directory=getattr(args, "directory", None), workspace=getattr(args, "workspace", None), timeout=timeout)
         else:
@@ -3663,6 +3680,16 @@ def _add_idle_watch_subparsers(sub: argparse._SubParsersAction) -> None:
         default=_IDLE_WATCH_STOP_TIMEOUT_DEFAULT,
         help=(f"Stop timeout (seconds) after SIGTERM. Default: {_IDLE_WATCH_STOP_TIMEOUT_DEFAULT}"),
     )
+    common.add_argument(
+        "--wt-id",
+        default="",
+        help="Worktree ID for context in stuck-notify messages.",
+    )
+    common.add_argument(
+        "--agent",
+        default="",
+        help="Agent name for context in stuck-notify messages.",
+    )
 
     def _add_notify_args(parser: argparse.ArgumentParser) -> None:
         parser.add_argument(
@@ -3790,6 +3817,102 @@ def cmd_pool_release(args: argparse.Namespace, config: Config) -> None:
 
 def cmd_pool_dispatch(args: argparse.Namespace, config: Config) -> None:
     cmd_dispatch(args, config)
+
+
+def _render_continue_prompt(wt_id: str, agent: str, branch: str, wt_path: Path, old_sid: str) -> str:
+    """Generate a continuation prompt for ``pool continue``."""
+    lines: list[str] = []
+    try:
+        log_out = git(wt_path, "log", "--oneline", "-10", capture=True).stdout.strip()
+    except Exception:
+        log_out = "(git log failed)"
+    lines.append(f"前一个 {agent} session（{old_sid}）在分支 {branch}（{wt_id}）上工作时卡住，可能已部分完成。")
+    lines.append("")
+    lines.append("请检查分支当前状态：")
+    lines.append(f"- git log 查看已完成 commits：\n```\n{log_out}\n```")
+    lines.append("- git diff / git status 查看未提交修改")
+    lines.append("- pytest / ruff / mypy 查看当前质量")
+    lines.append("")
+    lines.append("确认已完成部分后，继续完成剩余工作。不要重写已完成的 commits。")
+    return "\n".join(lines)
+
+
+def cmd_pool_continue(args: argparse.Namespace, config: Config) -> None:
+    """Continue work on a stuck session — same branch, new session, auto-prompt."""
+    check_services(config)
+    wt_id = args.wt_id
+    validate_wt_id(wt_id)
+    state = read_state(config, wt_id)
+    agent = args.agent
+    branch = state.get("branch", "")
+    wt_path = Path(state.get("wt_path") or path_for_wt(config, wt_id)).resolve()
+    if not branch:
+        fail(f"{wt_id} has no active branch; use pool prepare first")
+    old_sid = state.get(f"{agent}_session_id", "")
+    if old_sid:
+        status_map = http_json("GET", f"{config.sidecar}/status")
+        session_status = "unknown"
+        if isinstance(status_map, dict):
+            session_status = str(status_map.get(old_sid, "unknown"))
+        if session_status not in ("busy", "streaming"):
+            eprint(f"note: old session {old_sid} is {session_status} (not stuck); continuing anyway")
+    # Build continuation prompt (preview-safe: no side effects before --yes)
+    prompt_text = _render_continue_prompt(wt_id, agent, branch, wt_path, old_sid)
+    if args.task:
+        prompt_text = args.task.strip() + "\n\n---\n\n" + prompt_text
+    # Build dispatch body
+    provider_id, model_id, variant = opencode_model(config, agent)
+    body: dict[str, Any] = {
+        "agent": agent,
+        "model": prompt_model(provider_id, model_id),
+        "parts": [{"type": "text", "text": prompt_text}],
+    }
+    if variant:
+        body["variant"] = variant
+    model_label = f"{provider_id}/{model_id}" + (f":{variant}" if variant else "")
+    preview = {
+        "send": bool(args.yes),
+        "wt_id": wt_id,
+        "agent": agent,
+        "branch": branch,
+        "old_session": old_sid or "(none)",
+        "model": model_label,
+        "directory": str(wt_path),
+        "prompt": prompt_text,
+    }
+    if not args.yes:
+        print(json.dumps(preview, ensure_ascii=False, indent=2))
+        print()
+        notify_flag = f" --notify-session {args.notify_session}" if args.notify_session else ""
+        print(f"python3 scripts/session-worktree-mgr.py pool continue {args.wt_id} {agent} --yes{notify_flag}")
+        return
+    # --yes: delete old stuck session, create fresh one, dispatch
+    if old_sid:
+        delete_session(config, old_sid, hard=True)
+        eprint(f"hard-deleted stuck session: {old_sid}")
+    update_state(config, wt_id, {f"{agent}_session_id": ""})
+    new_ses = ensure_session(config, wt_id, wt_path, agent, recreate_existing=True)
+    sid = new_ses["id"]
+    persist_session(config, wt_id, agent, new_ses)
+    watch_session(config, sid)
+    query = urllib.parse.urlencode({"directory": str(wt_path)})
+    url = f"{config.op_server}/session/{sid}/prompt_async?{query}"
+    dispatch_started_at_ms = int(time.time() * 1000)
+    http_json("POST", url, body, expected=(204,))
+    print(f"continued -> {wt_id}-{agent} ({sid}) branch={branch} model={model_label} directory={wt_path}")
+    notify_sid = args.notify_session or config.pm_session_id
+    if notify_sid:
+        _idle_validate_ses("--notify-session", notify_sid)
+        _spawn_dispatch_idle_watch(
+            config,
+            sid,
+            notify_sid,
+            wt_path,
+            wt_id=wt_id,
+            agent=agent,
+            max_poll_seconds=args.max_poll_seconds,
+            started_at_ms=dispatch_started_at_ms,
+        )
 
 
 def cmd_session_show(args: argparse.Namespace, config: Config) -> None:
@@ -4087,6 +4210,12 @@ Use cases:
     pool_dispatch.add_argument("agent", help="Agent name, e.g. Daedalus")
     _add_dispatch_options(pool_dispatch, allow_session=False)
     pool_dispatch.set_defaults(func=cmd_pool_dispatch, session=None)
+
+    pool_continue = pool_sub.add_parser("continue", help="Continue work on a stuck session — create new session on same branch, auto-generate continuation prompt.")
+    pool_continue.add_argument("wt_id", help="Pool worktree id, e.g. wt_1")
+    pool_continue.add_argument("agent", help="Agent name, e.g. Daedalus")
+    _add_dispatch_options(pool_continue, allow_session=False)
+    pool_continue.set_defaults(func=cmd_pool_continue, session=None)
 
     pool_release = pool_sub.add_parser("release", help="Reset a task worktree and mark it idle.")
     pool_release.add_argument("target", help="wt_N or worktree path")
