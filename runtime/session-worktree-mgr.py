@@ -1530,11 +1530,6 @@ def cmd_dispatch(args: argparse.Namespace, config: Config) -> None:
         fail(f"session {sid} not dispatchable: {session_status} (--require-no-busy)")
     if session_status in ("busy", "streaming"):
         force_recover = getattr(args, "force", False)
-        if args.session:
-            # --session dispatch doesn't support forced recovery (named session)
-            if force_recover:
-                fail("--force not supported for --session dispatch; use pool dispatch wt_N Agent --force instead")
-            fail(f"session {sid} is not dispatchable: {session_status}")
         if not force_recover:
             # Auto-recover if session has been stuck > 15 min
             ses = get_session_by_id(config, sid, directory=wt_path)
@@ -1543,10 +1538,16 @@ def cmd_dispatch(args: argparse.Namespace, config: Config) -> None:
                 eprint(f"auto-recovering stuck session {sid} (busy > {STALE_DISPATCH_MS // 60000}min)")
         if force_recover:
             delete_session(config, sid, hard=True)
-            update_state(config, wt_id, {f"{agent}_session_id": ""})
-            ses = ensure_session(config, wt_id, wt_path, agent, recreate_existing=True)
-            sid = ses["id"]
-            persist_session(config, wt_id, agent, ses)
+            if args.session:
+                # Main session: hard-delete old + create new + dispatch
+                new_ses = create_session(config, "main", wt_path, agent)
+                sid = new_ses["id"]
+                persist_main_session(config, agent, new_ses)
+            else:
+                update_state(config, wt_id, {f"{agent}_session_id": ""})
+                new_ses = ensure_session(config, wt_id, wt_path, agent, recreate_existing=True)
+                sid = new_ses["id"]
+                persist_session(config, wt_id, agent, new_ses)
             watch_session(config, sid)
             status_map = http_json("GET", f"{config.sidecar}/status")
             session_status = "unknown"
