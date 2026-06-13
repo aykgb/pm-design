@@ -2012,6 +2012,40 @@ def cmd_last(args: argparse.Namespace, config: Config) -> None:
 
 # ---------------- overview ----------------
 
+# Overview fetches ALL sessions once (not per-wt) to minimise HTTP calls to
+# the OpenCode server.  A single ``GET /session?limit=2000`` replaces ~10
+# per-worktree calls.  The client-side filter mirrors ``collect_wt_sessions``.
+_OVERVIEW_SESSION_LIMIT = 2000
+
+
+def _filter_sessions_for_wt(
+    all_sessions: list[dict[str, Any]],
+    wt_id: str,
+    wt_path: str,
+) -> list[dict[str, Any]]:
+    """Return sessions belonging to wt_id from a pre-fetched master list."""
+    if wt_id == "xidi-minimal":
+        out: list[dict[str, Any]] = []
+        n_wt_path = normalize_path(wt_path)
+        for s in all_sessions:
+            meta = s.get("metadata", {}) or {}
+            sdir = s.get("directory", "")
+            sid_wt = meta.get("wt_id")
+            if sid_wt and sid_wt != "main":
+                continue
+            if not sdir or normalize_path(str(sdir)) != n_wt_path:
+                continue
+            out.append(s)
+        return out
+    # wt_N: match by metadata.wt_id or title prefix
+    out = []
+    for s in all_sessions:
+        meta = s.get("metadata", {}) or {}
+        title = s.get("title", "")
+        if meta.get("wt_id") == wt_id or title.startswith(f"{wt_id}-"):
+            out.append(s)
+    return out
+
 
 def collect_worktree_list(repo: Path) -> list[dict[str, str]]:
     """List all worktrees via ``git worktree list --porcelain``.
@@ -2393,11 +2427,34 @@ def collect_overview(
     the unlisted-agent fallback warning. Wired from ``--verbose`` (overview
     subcommand).
     """
+    # Fetch ALL sessions once (replaces ~10 per-wt HTTP calls with 1).
+    all_sessions = sessions(config, limit=_OVERVIEW_SESSION_LIMIT)
     wts = collect_worktree_list(config.repo)
     rows: list[dict[str, Any]] = []
     for wt in wts:
         enrich_worktree_status(wt)
-        sess_list = collect_wt_sessions(config, wt["id"], wt["path"])
+        sess_list = _filter_sessions_for_wt(all_sessions, wt["id"], wt["path"])
+        # Main worktree: also pull PM sessions referenced by state files that
+        # fall outside the global list window.  (With limit=2000 this should
+        # be rare, but the state directory is the source of truth.)
+        if wt["id"] == "xidi-minimal":
+            seen_ids = {str(s.get("id") or "") for s in sess_list if s.get("id")}
+            for pm_sid, _state_file, _is_current in recent_pm_state_files(config):
+                if not pm_sid or pm_sid in seen_ids:
+                    continue
+                try:
+                    pm_ses = http_json(
+                        "GET",
+                        f"{config.op_server}/session/{urllib.parse.quote(pm_sid)}",
+                    )
+                except SystemExit:
+                    continue
+                if not isinstance(pm_ses, dict):
+                    continue
+                sdir = pm_ses.get("directory", "")
+                if not sdir or normalize_path(str(sdir)) != normalize_path(wt["path"]):
+                    continue
+                sess_list.append(pm_ses)
         # Normalize to (wt_id, agent, updated_ms) tuples for the filter, but
         # also keep the raw session dict so we can render after filtering.
         indexed: list[dict[str, Any]] = []
