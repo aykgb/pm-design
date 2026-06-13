@@ -1,0 +1,106 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "comment": "PM System OpenCode 配置模板。复制到项目 .opencode/opencode.json 后按需修改。",
+  "permission": {
+    "grep": "allow",
+    "glob": "allow",
+    "read": "allow",
+    "todowrite": "allow",
+    "question": "allow",
+    "webfetch": "allow",
+    "gh pr merge*": "deny",
+    "gh api *pulls/*/merge*": "ask",
+    "gh api graphql*mergePullRequest*": "ask",
+    "external_directory": {
+      "/tmp/*": "allow",
+      "~/.worktrees/<project-name>/*": "allow"
+    }
+  },
+  "instructions": [
+    ".pm/operational_conventions.md"
+  ],
+  "default_agent": "PM",
+  "small_model": "<flash-model>",
+  "agent": {
+    "PM": {
+      "model": "<premium-model>",
+      "variant": "max",
+      "color": "#a64076"
+    },
+    "Daedalus": {
+      "model": "<standard-model>",
+      "variant": "max"
+    },
+    "Themis": {
+      "model": "<standard-model>",
+      "variant": "max"
+    },
+    "QA": {
+      "model": "<standard-model>",
+      "variant": "max"
+    },
+    "Momus": {
+      "model": "<standard-model>",
+      "variant": "max"
+    },
+    "Clio": {
+      "model": "<standard-model>",
+      "variant": "max"
+    },
+    "Morpheus": {
+      "model": "<standard-model>",
+      "variant": "max"
+    },
+    "Janitor": {
+      "model": "<flash-model>",
+      "temperature": 0.1,
+      "variant": "medium"
+    },
+    "WebSearch": {
+      "model": "<flash-model>",
+      "variant": "max"
+    },
+    "General": {
+      "model": "<standard-model>",
+      "variant": "max"
+    },
+    "general": {
+      "model": "<standard-model>",
+      "variant": "max"
+    },
+    "explore": {
+      "model": "<flash-model>",
+      "temperature": 0.3,
+      "variant": "max"
+    },
+    "plan": { "disable": true },
+    "build": { "disable": true }
+  },
+  "provider": {
+    "<provider-name>": {
+      "models": {
+        "<model-name>": {
+          "variants": {
+            "off": { "thinking": { "type": "disabled" } },
+            "adaptive": { "thinking": { "type": "adaptive" } },
+            "high": { "thinking": { "type": "enabled", "budgetTokens": 16000 } },
+            "max": { "thinking": { "type": "enabled", "budgetTokens": 32000 } }
+          }
+        }
+      }
+    }
+  },
+  "mcp": {
+    "playwright": {
+      "type": "local",
+      "command": ["npx", "-y", "@playwright/mcp"],
+      "enabled": true
+    },
+    "context7": {
+      "type": "remote",
+      "url": "https://mcp.context7.com/mcp",
+      "enabled": true,
+      "headers": { "CONTEXT7_API_KEY": "<your-key>" }
+    }
+  }
+}

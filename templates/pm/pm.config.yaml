@@ -15,12 +15,17 @@ project:
 # ── Agent 体系 ────────────────────────────────
 agents:
   # 业务 Agent：pool worktree 串行，实现 / 审查 / 验证
-  dev: "{{dev_agent}}"       # 后端/前端实现 Agent
-  review: "{{review_agent}}" # 代码审查 Agent（P0/P1 零容忍）
-  qa: "{{qa_agent}}"         # 测试验证 Agent
+  dev: "Daedalus"      # 后端实现 Agent
+  review: "Themis"     # 代码审查 Agent（P0/P1 零容忍）
+  qa: "QA"             # 测试验证 Agent
+  frontend: "Morpheus" # 前端实现 Agent
 
   # PM 域 Agent：main session dispatch
-  gate: "{{gate_agent}}"     # Spec 门禁审查 Agent（可选）
+  gate: "Momus"        # Spec 门禁审查 Agent
+  doc: "Clio"          # 文档审查 Agent
+
+  # 工具 Agent：subagent fire-and-forget
+  janitor: "Janitor"   # 杂务 Agent
 
 # ── 开发流水线 ────────────────────────────────
 pipeline:

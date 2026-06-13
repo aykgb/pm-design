@@ -41,10 +41,13 @@ def read_config() -> dict[str, str]:
     """Read pm.config.yaml or return defaults inferred from project docs."""
     config: dict[str, str] = {
         "project_name": "MyProject",
-        "dev_agent": "DevAgent",
-        "review_agent": "ReviewAgent",
-        "qa_agent": "QAAgent",
-        "gate_agent": "SpecGate",
+        "dev_agent": "Daedalus",
+        "review_agent": "Themis",
+        "qa_agent": "QA",
+        "gate_agent": "Momus",
+        "frontend_agent": "Morpheus",
+        "doc_agent": "Clio",
+        "janitor_agent": "Janitor",
         "branch_prefix": "feat_P",
     }
 
@@ -62,6 +65,9 @@ def read_config() -> dict[str, str]:
                 config["review_agent"] = agents.get("review", config["review_agent"])
                 config["qa_agent"] = agents.get("qa", config["qa_agent"])
                 config["gate_agent"] = agents.get("gate", config["gate_agent"])
+                config["frontend_agent"] = agents.get("frontend", config["frontend_agent"])
+                config["doc_agent"] = agents.get("doc", config["doc_agent"])
+                config["janitor_agent"] = agents.get("janitor", config["janitor_agent"])
             if "conventions" in yml and "branch_prefix" in yml["conventions"]:
                 config["branch_prefix"] = yml["conventions"]["branch_prefix"]
 
@@ -364,6 +370,10 @@ def main() -> None:
         ("dev_agent", "dev.agent.md"),
         ("review_agent", "review.agent.md"),
         ("qa_agent", "qa.agent.md"),
+        ("frontend_agent", "frontend.agent.md"),
+        ("gate_agent", "spec-gate.agent.md"),
+        ("doc_agent", "doc-review.agent.md"),
+        ("janitor_agent", "housekeeping.agent.md"),
     ]:
         tpl = TEMPLATES_AGENTS / tpl_name
         agent_name = config[key]
@@ -372,6 +382,14 @@ def main() -> None:
             generated += 1
         elif tgt.exists():
             skipped += 1
+
+    # PM agent（名称固定为 PM）
+    pm_tpl = TEMPLATES_AGENTS / "pm.agent.md"
+    pm_tgt = PROJECT_ROOT / ".opencode" / "agents" / "pm.md"
+    if generate_file(pm_tpl, pm_tgt, config, args.dry_run):
+        generated += 1
+    elif pm_tgt.exists():
+        skipped += 1
 
     # Special files
     for fn in [generate_pm_config, generate_project_tasks, generate_devlog]:
