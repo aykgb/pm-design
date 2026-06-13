@@ -1458,6 +1458,8 @@ def cmd_prepare(args: argparse.Namespace, config: Config) -> None:
     print(f'{PROG} pool dispatch {wt_id} {agents[0]} --task "..." --yes')
     print()
     print("（可选：加 --notify-session <PM_SESSION_ID> 自动 idle-watch，或设 $PM_SESSION_ID）")
+    print()
+    print(f"已分配: {wt_id}")
 
 
 def render_prompt(wt_dir: Path, task: str) -> str:
