@@ -1,6 +1,5 @@
 {
   "$schema": "https://opencode.ai/config.json",
-  "comment": "PM System OpenCode 配置模板。复制到项目 .opencode/opencode.json 后按需修改模型和 provider。",
   "permission": {
     "grep": "allow",
     "glob": "allow",
