@@ -41,6 +41,7 @@ def read_config() -> dict[str, str]:
     """Read pm.config.yaml or return defaults inferred from project docs."""
     config: dict[str, str] = {
         "project_name": "MyProject",
+        "project_description": "（在此描述项目目标）",
         "dev_agent": "Daedalus",
         "review_agent": "Themis",
         "qa_agent": "QA",
@@ -401,6 +402,22 @@ def main() -> None:
         else:
             if fn(args.dry_run):
                 generated += 1
+
+    # Copy opencode.json config（如不存在，不做占位符替换——用户手工改 <project-name>）
+    opencode_tpl = DESIGN_DIR / "templates" / "opencode.json"
+    opencode_tgt = PROJECT_ROOT / ".opencode" / "opencode.json"
+    if opencode_tpl.exists() and not opencode_tgt.exists():
+        if args.dry_run:
+            print(f"   📄 将复制: {opencode_tgt}")
+            generated += 1
+        else:
+            import shutil
+            opencode_tgt.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(opencode_tpl, opencode_tgt)
+            print(f"   ✅ 复制: opencode.json → .opencode/")
+            generated += 1
+    elif opencode_tgt.exists():
+        skipped += 1
 
     # Copy skills from pm-design
     sc, ss = copy_skills(args.dry_run)
