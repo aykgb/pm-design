@@ -2583,6 +2583,11 @@ def _print_session_rows(
         sstate = str(status_map.get(sid, "unwatch"))
         if sstate == "unknown":
             sstate = "unwatch"
+        # Flag stuck sessions (busy/streaming + no update > STALE_DISPATCH_MS)
+        if sstate in ("busy", "streaming"):
+            updated_ms = sess.get("updated_ms", 0)
+            if updated_ms and (int(time.time() * 1000) - updated_ms) > STALE_DISPATCH_MS:
+                sstate += " [STUCK]"
         if is_main:
             prefix = f"  {'':<14} {'':<40} {'':<9} {'':<7} {'':<6}"
         else:
