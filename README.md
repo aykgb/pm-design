@@ -1,4 +1,4 @@
-# PM System Kit
+# PM DevKit
 
 > 基于 **OpenCode + Worktree Pool + 多 Agent 异步协作** 的通用 PM 调度系统。以 git submodule 分发，跨项目复用。
 
@@ -6,7 +6,7 @@
 
 ```bash
 # 1. 添加 submodule
-git submodule add https://github.com/aykgb/pm-design .pm/design
+git submodule add https://github.com/aykgb/pm-devkit .pm/design
 
 # 2. Bootstrap — 复制 skills / runtime / templates 到项目
 python .pm/design/scripts/pm-bootstrap.py
@@ -85,7 +85,7 @@ python3 scripts/session-worktree-mgr.py overview
 ```
 .pm/design/
   README.md                     ← 本文件
-  pm_system_design.md           ← 总纲（架构全景图 + 子系统索引）
+  pm_devkit_design.md           ← 总纲（架构全景图 + 子系统索引）
   adr/                          ← 架构决策记录（按编号）
   specs/                        ← 7 个子系统详细规格
     agent-system.md             ← Agent 体系

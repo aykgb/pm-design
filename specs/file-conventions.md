@@ -78,7 +78,7 @@ Todo → In Progress → Done → Recently Completed
 implementation_plan.md         ← Phase 目标（Source of Truth）
         │
         ▼
-pm_system_design.md            ← 怎么拆、怎么派、怎么跑（总纲）
+pm_devkit_design.md            ← 怎么拆、怎么派、怎么跑（总纲）
   ├── agent-system.md          ← Agent 体系
   ├── pipeline-system.md       ← 流水线详细步骤
   ├── spec-breakdown.md        ← Spec 拆解 + Batch 设计

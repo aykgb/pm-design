@@ -5,7 +5,7 @@ description: PM 专用：Workflow I(nit) 项目初始化。优先使用 `scripts
 
 # pm-workflow-init
 
-PM 专用 skill——项目首次初始化。对齐 `.pm/design/pm_system_design.md` §0.1 "最小文件集合"。
+PM 专用 skill——项目首次初始化。对齐 `.pm/devkit/pm_devkit_design.md` §0.1 "最小文件集合"。
 
 ## 触发规则
 
@@ -25,7 +25,7 @@ PM 专用 skill——项目首次初始化。对齐 `.pm/design/pm_system_design
 ### 1. 前置检查
 
 - `docs/implementation_plan.md` 是否存在
-- `.pm/design/` submodule 是否存在
+- `.pm/devkit/` submodule 是否存在
 - 两者都存在 → **路径 A**（运行 bootstrap 脚本）
 - 仅 plan 存在 → **路径 B**（手工创建）
 - plan 不存在 → **路径 C**（降级初始化）
@@ -37,14 +37,14 @@ PM 专用 skill——项目首次初始化。对齐 `.pm/design/pm_system_design
 ### 2. 运行 bootstrap 脚本
 
 ```bash
-python .pm/design/scripts/pm-bootstrap.py --from docs/
+python .pm/devkit/scripts/pm-bootstrap.py --from docs/
 ```
 
 脚本自动：
 
 - 读 `implementation_plan.md` → 推断项目名和当前 Phase
 - 读 `pm.config.yaml`（如存在）→ 获取 Agent 名称
-- 从 `.pm/design/templates/` 复制骨架到 `.pm/` + `.opencode/agents/`
+- 从 `.pm/devkit/templates/` 复制骨架到 `.pm/` + `.opencode/agents/`
 - 创建 `docs/project_tasks.md`（含 Phase 信息）
 - 创建 `docs/development_log.md`（空表）
 - 创建 `pm.config.yaml`（首次）
@@ -93,8 +93,8 @@ docs/
 
 | 文件 | 来源 | 创建方式 |
 |------|------|---------|
-| `.pm/project_memory.md` | `.pm/design/templates/pm/project_memory.md` | PM 直接写（填入项目名 + 当前 Phase） |
-| `.pm/operational_conventions.md` | `.pm/design/templates/pm/operational_conventions.md` | PM 直接写 |
+| `.pm/project_memory.md` | `.pm/devkit/templates/pm/project_memory.md` | PM 直接写（填入项目名 + 当前 Phase） |
+| `.pm/operational_conventions.md` | `.pm/devkit/templates/pm/operational_conventions.md` | PM 直接写 |
 | `.pm/persona.md` | 模板项目 `persona.md` | PM 直接写（含管理模式 + 闲聊模式） |
 | `.pm/user_profile.md` | 空模板（头部 + 分类占位） | PM 直接写 |
 | `.pm/user_behavior.md` | 空模板（统计初始化为 0） | PM 直接写 |
