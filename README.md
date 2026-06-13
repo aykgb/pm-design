@@ -23,28 +23,6 @@ python .pm/design/scripts/pm-bootstrap.py
 
 ## 核心能力
 
-### `overview` — 全局状态一览
-
-一条命令看清整个多 agent 系统的运行状态：
-
-```bash
-python3 scripts/session-worktree-mgr.py overview
-```
-
-![overview 截图](diagrams/overview.png)
-
-- **服务健康** · **Worktree 表格**（branch / commit / dirty / Δmain） · **Session 详情**（Input / Output+Reasoning / Cache Hit% / Context 剩余 / idle-busy-streaming 状态） · **PM 会话分组** · **`[STUCK]` 标记**
-- 一次拉取全部 session 信息：1 次 HTTP `/session?limit=2000` + 1 次 sidecar `/status`
-
-### Stuck 检测 & 自愈
-
-- **Stuck 检测**：dispatch 时 idle-watch 自动启动，轮询 sidecar status。session busy > 15min 且 `time.updated` 无刷新 → `[stuck-notify]` 通知 PM session（含 wt / agent 上下文）
-- **续接**：`pool continue wt_N Daedalus --yes` — 保留分支和已推 commits，新 session 自动续接（含 `git log` 快照）
-- **强制恢复**：`pool dispatch --force` 对 busy+stale session 自动 hard-delete + 重建
-- **Stale 清理**：`pool release` 自动归档 >1d 旧 session、清理 tombstoned ID
-
-> 详见 [`specs/runtime-architecture.md`](specs/runtime-architecture.md) §自愈
-
 ### 多 Agent 异步协作
 
 基于 OpenCode session + prompt_async API 的异步 agent 池：
@@ -65,8 +43,6 @@ python3 scripts/session-worktree-mgr.py overview
 | `persona.md` | 双模式人格（管理/闲聊）、语气边界、根因分析优先 |
 | `operational_conventions.md` | 5 组操作约定（OC0 优先级 · OC1 沟通 · OC2 分支 · OC3 派发 · OC4 模式 · OC5 开发） |
 | `project_memory.md` | 交互历史、agent 派发模板、项目决策、Workflow 路由 |
-| `user_profile.md` | 开发者偏好、习惯、性格画像 |
-| `user_behavior.md` | 行为日志、模式切换频率、使用摘要 |
 
 ```jsonc
 // plugins/pm-guardian.conf.json
@@ -79,6 +55,28 @@ python3 scripts/session-worktree-mgr.py overview
   ]
 }
 ```
+
+### Stuck Sessions 检测 & 自愈
+
+- **Stuck 检测**：dispatch 时 idle-watch 自动启动，轮询 sidecar status。session busy > 15min 且 `time.updated` 无刷新 → `[stuck-notify]` 通知 PM session（含 wt / agent 上下文）
+- **续接**：`pool continue wt_N Daedalus --yes` — 保留分支和已推 commits，新 session 自动续接（含 `git log` 快照）
+- **强制恢复**：`pool dispatch --force` 对 busy+stale session 自动 hard-delete + 重建
+- **Stale 清理**：`pool release` 自动归档 >1d 旧 session、清理 tombstoned ID
+
+> 详见 [`specs/runtime-architecture.md`](specs/runtime-architecture.md) §自愈
+
+### `Overview` — Sessions 全局状态一览
+
+一条命令看清整个多 agent 系统的运行状态：
+
+```bash
+python3 scripts/session-worktree-mgr.py overview
+```
+
+![overview 截图](diagrams/overview.png)
+
+- **服务健康** · **Worktree 表格**（branch / commit / dirty / Δmain） · **Session 详情**（Input / Output+Reasoning / Cache Hit% / Context 剩余 / idle-busy-streaming 状态） · **PM 会话分组** · **`[STUCK]` 标记**
+- 一次拉取全部 session 信息：1 次 HTTP `/session?limit=2000` + 1 次 sidecar `/status`
 
 ## 目录
 
