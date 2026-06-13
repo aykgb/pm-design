@@ -3240,6 +3240,8 @@ def cmd_idle_watch(args: argparse.Namespace, config: Config) -> None:
     consecutive_errors = 0
     saw_busy_or_streaming = False
     idle_after_update_notified = False
+    busy_since: float | None = None  # monotonic timestamp when busy/streaming started
+    stuck_notified = False  # only fire stuck notification once per busy streak
 
     while True:
         if deadline is not None and time.monotonic() > deadline:
@@ -3273,6 +3275,18 @@ def cmd_idle_watch(args: argparse.Namespace, config: Config) -> None:
 
         if current_status in ("busy", "streaming"):
             saw_busy_or_streaming = True
+            if busy_since is None:
+                busy_since = time.monotonic()
+            elif not stuck_notified and (time.monotonic() - busy_since) > (STALE_DISPATCH_MS / 1000):
+                # session stuck > 15 min — notify PM once
+                stuck_notified = True
+                msg = f"[stuck-notify] target={target} stuck in {current_status} > {STALE_DISPATCH_MS // 60000}min"
+                eprint(msg)
+                _idle_prompt_async(config, notify, msg, directory=getattr(args, "directory", None), workspace=getattr(args, "workspace", None), timeout=timeout)
+        else:
+            # status changed away from busy/streaming — reset stuck tracking
+            busy_since = None
+            stuck_notified = False
 
         should_notify = False
         notify_reason = ""
