@@ -12,6 +12,7 @@
 | **开发 Agent** | pool wt | 后端/前端实现，commit+push+create PR | "按 spec 写代码，建 PR" |
 | **审查 Agent** | 同 wt | 代码审查，P0/P1 零容忍 | "这代码能合吗" |
 | **QA Agent** | 同 wt | lint + type-check + test | "测试过了吗" |
+| **前端 Agent** | pool wt | 静态 HTML/JS/ECharts，不动后端/DB/交易 | "按 spec 做页面" |
 | **General** | main session | 工具链修复 / Spec 拆解，PM 显式给 workflow | "定位这个 bug，拆这个 Phase" |
 | **Spec 门禁** | main session | Phase 任务 spec 审视，派发前强制通过 | "这个 spec 能派吗" |
 | **文档审查** | main session | 文档漂移/矛盾/过时引用 | "文档和代码一致吗" |
@@ -34,6 +35,7 @@ PM 域 Agent（main session，按需）→ 详见 runtime-architecture.md
 | 交互 | 派发格式 | 产出 | 不做什么 |
 | --- | --- | --- | --- |
 | PM → 开发 | task ID（"做 P3-T1"） | commit hash + PR URL | 不替 agent 做设计决策 |
+| PM → 前端 | task ID（"做 P6-T1"） | PR URL | 不替 agent 做设计决策 |
 | PM → 审查 | "review P<N>-T<M>" | P0/P1/P2 报告 | 不修代码 |
 | PM → QA | "验证 P<N>-T<M>" | 通过/失败 + 原因 | 不修代码 |
 | PM → General | impl_plan §N + 必读文档清单 + 产出要求 | 定位报告 / spec 文件 | 不口述 spec 细节 |
