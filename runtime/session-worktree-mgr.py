@@ -3289,12 +3289,18 @@ def cmd_idle_watch(args: argparse.Namespace, config: Config) -> None:
             saw_busy_or_streaming = True
             if busy_since is None:
                 busy_since = time.monotonic()
-            elif not stuck_notified and (time.monotonic() - busy_since) > (STALE_DISPATCH_MS / 1000):
-                # session stuck > 15 min — notify PM once
-                stuck_notified = True
-                msg = f"[stuck-notify] target={target} stuck in {current_status} > {STALE_DISPATCH_MS // 60000}min"
-                eprint(msg)
-                _idle_prompt_async(config, notify, msg, directory=getattr(args, "directory", None), workspace=getattr(args, "workspace", None), timeout=timeout)
+            if not stuck_notified:
+                # Use session's own time.updated (ms epoch), not watcher's
+                # busy_since. A session actively producing output refreshes
+                # its updated timestamp; only truly stalled sessions go stale.
+                ses_data = get_session_by_id(config, target)
+                if ses_data:
+                    updated_ms = int((ses_data.get("time") or {}).get("updated", 0))
+                    if updated_ms > 0 and (time.time() * 1000 - updated_ms) > STALE_DISPATCH_MS:
+                        stuck_notified = True
+                        msg = f"[stuck-notify] target={target} stuck in {current_status} > {STALE_DISPATCH_MS // 60000}min (last updated {time.time() * 1000 - updated_ms:.0f}ms ago)"
+                        eprint(msg)
+                        _idle_prompt_async(config, notify, msg, directory=getattr(args, "directory", None), workspace=getattr(args, "workspace", None), timeout=timeout)
         else:
             # status changed away from busy/streaming — reset stuck tracking
             busy_since = None
