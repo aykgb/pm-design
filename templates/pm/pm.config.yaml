@@ -1,4 +1,4 @@
-# PM System Configuration
+# PM DevKit Configuration
 # ========================
 # 通用 PM 调度系统配置模板。
 # Bootstrap 时读取此文件生成项目 pm.config.yaml；

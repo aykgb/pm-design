@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>PM System Architecture — OpenCode · Worktree Pool · Multi-Agent Async</title>
+  <title>PM DevKit Architecture — OpenCode · Worktree Pool · Multi-Agent Async</title>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js" integrity="sha384-ZZ1pncU3bQe8y31yfZdMFdSpttDoPmOZg2wguVK9almUodir1PghgT0eY7Mrty8H" crossorigin="anonymous"></script>
   <script src="https://cdn.jsdelivr.net/npm/jspdf@2.5.2/dist/jspdf.umd.min.js" integrity="sha384-en/ztfPSRkGfME4KIm05joYXynqzUgbsG5nMrj/xEFAHXkeZfO3yMK8QQ+mP7p1/" crossorigin="anonymous"></script>
@@ -66,7 +66,7 @@
     <div class="header">
       <div class="header-row">
         <div class="pulse-dot"></div>
-        <h1>PM System Architecture</h1>
+        <h1>PM DevKit Architecture</h1>
         <div class="toolbar">
           <div class="toolbar-actions">
             <button onclick="copyAsImage(this)">📋 Copy</button>
@@ -612,7 +612,7 @@
         const r = el.getBoundingClientRect();
         const pad = 32;
         const canvas = await html2canvas(document.body, { backgroundColor: '#020617', scale: 2, useCORS: true, ignoreElements: (e) => e.classList && e.classList.contains('toolbar'), x: r.left + window.scrollX - pad, y: r.top + window.scrollY - pad, width: r.width + pad * 2, height: r.height + pad * 2 });
-        const link = document.createElement('a'); link.download = 'pm-system-architecture.png'; link.href = canvas.toDataURL('image/png'); link.click();
+        const link = document.createElement('a');         link.download = 'pm-devkit-architecture.png'; link.href = canvas.toDataURL('image/png'); link.click();
         btn.textContent = '✓ Done!';
       } catch (e) { btn.textContent = '✗ Failed'; }
       setTimeout(() => btn.textContent = orig, 2000);
@@ -629,7 +629,7 @@
         const orientation = canvas.width > canvas.height ? 'landscape' : 'portrait';
         const pdf = new jsPDF({ orientation, unit: 'px', format: [canvas.width, canvas.height], hotfixes: ['px_scaling'] });
         pdf.addImage(imgData, 'PNG', 0, 0, canvas.width, canvas.height);
-        pdf.save('pm-system-architecture.pdf');
+        pdf.save('pm-devkit-architecture.pdf');
         btn.textContent = '✓ Done!';
       } catch (e) { btn.textContent = '✗ Failed'; }
       setTimeout(() => btn.textContent = orig, 2000);

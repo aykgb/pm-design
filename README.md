@@ -17,7 +17,7 @@ python .pm/design/scripts/pm-bootstrap.py
 
 ## 架构图
 
-[![PM System Kit Architecture](diagrams/pm-system-architecture.png)](diagrams/pm-system-architecture.html)
+[![PM DevKit Architecture](diagrams/pm-devkit-architecture.png)](diagrams/pm-devkit-architecture.html)
 
 > 点击图片在新窗口打开交互式架构图（支持 📋 Copy · 🖼️ PNG · 📄 PDF 导出）。
 
@@ -96,8 +96,8 @@ python3 scripts/session-worktree-mgr.py overview
     worktree-session-mgmt.md    ← Worktree/Session 状态体系
     file-conventions.md         ← 文件体系 + 约定
   diagrams/                     ← 架构图 + 截图
-    pm-system-architecture.html ← 交互式架构图（含导出功能）
-    pm-system-architecture.png  ← 架构图截图
+    pm-devkit-architecture.html ← 交互式架构图（含导出功能）
+    pm-devkit-architecture.png  ← 架构图截图
     overview.png                ← overview 命令截图
   templates/                    ← 骨架模板（含占位符，bootstrap 时渲染）
     pm/                         ← PM 域模板（CLAUDE / memory / conventions / persona）

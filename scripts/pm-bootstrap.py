@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""PM System Bootstrap — 从 .pm/design/templates/ 生成 PM 域文件。
+"""PM DevKit Bootstrap — 从 .pm/design/templates/ 生成 PM 域文件。
 
 用法：
     python scripts/pm-bootstrap.py                              # 交互式（默认读 pm.config.yaml）
@@ -224,7 +224,7 @@ def generate_pm_config(config: dict[str, str], dry_run: bool) -> bool:
     if CONFIG_FILE.exists():
         return False
 
-    content = f"""# PM System Configuration
+    content = f"""# PM DevKit Configuration
 # 自动生成于 bootstrap。手动微调后 pm bootstrap --from docs/ 不会覆盖已有值。
 
 project:
@@ -353,7 +353,7 @@ def _copy_dir(src: Path, dst: Path) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="PM System Bootstrap")
+    parser = argparse.ArgumentParser(description="PM DevKit Bootstrap")
     parser.add_argument("--from", dest="from_dir", default=None, help="从项目文档推断配置")
     parser.add_argument("--config", dest="config", default=None, help="自定义 pm.config.yaml 路径（默认：项目根目录）")
     parser.add_argument("--dry-run", action="store_true", help="预览，不写入文件")
