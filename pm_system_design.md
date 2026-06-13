@@ -39,6 +39,7 @@ Last updated: 2026-06-13
 | **Spec 拆解 & Batch** | [specs/spec-breakdown.md](specs/spec-breakdown.md) | Spec 拆解 8 步流程、Batch 合并/拆分原则、规模阈值 |
 | **Workflow 体系** | [specs/workflow-system.md](specs/workflow-system.md) | I/S/N/F/L/M/R/B 8 个 Workflow、核心链、模式切换 |
 | **运行时架构** | [specs/runtime-architecture.md](specs/runtime-architecture.md) | OpenCode 引擎分层、异步调度、Worktree Pool、迭代自愈 |
+| **Session/Worktree 管理** | [specs/worktree-session-mgmt.md](specs/worktree-session-mgmt.md) | Worktree/Session 状态体系、生命周期、持久化、sidecar 集成 |
 | **文件体系 & 约定** | [specs/file-conventions.md](specs/file-conventions.md) | PM 域目录结构、Task 状态机、提交权限、Backlog |
 
 ## 模板目录
@@ -46,14 +47,14 @@ Last updated: 2026-06-13
 | 目录 | 内容 |
 |------|------|
 | [templates/pm/](templates/pm/) | `CLAUDE.md` / `project_memory.md` / `operational_conventions.md` / `persona.md` / `pm.config.yaml` 骨架 |
-| [templates/agents/](templates/agents/) | 开发 Agent / 审查 Agent / QA Agent 定义骨架（含 `<agent-name>` 占位符） |
+| [templates/agents/](templates/agents/) | 8 个 Agent 定义骨架：PM / 开发 / 审查 / QA / 门禁 / 文档审查 / 前端 / 杂务（含 `<agent-name>` 占位符） |
 
 ## 运行时
 
 | 目录 | 内容 |
 |------|------|
 | [skills/](skills/) | 8 个 `pm-workflow-*` skill（PM 工作流引擎，bootstrap 时复制到项目 `.opencode/skills/`） |
-| [runtime/](runtime/) | `session-worktree-mgr.py` / `session-status-server.mjs`（bootstrap 时复制到项目 `scripts/`） |
+| [runtime/](runtime/) | `session-worktree-mgr.py` / `session-status-server.mjs` / `check-codex.sh` / `session-worktree-mgr.md`（bootstrap 时复制到项目 `scripts/`） |
 | [scripts/](scripts/) | `pm-bootstrap.py`（bootstrap 入口） |
 
 ## 决策记录
