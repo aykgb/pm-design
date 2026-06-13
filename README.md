@@ -35,6 +35,13 @@ vim pm.config.yaml
   templates/                    ← 骨架模板（含占位符，bootstrap 时复制）
     pm/                         ← .pm/ 域模板
     agents/                     ← Agent 定义模板
+  scripts/                      ← 工具脚本
+    pm-bootstrap.py             ← Bootstrap：生成 PM 域文件
+  runtime/                      ← 运行时组件
+    session-worktree-mgr.py     ← Worktree pool + session 管理引擎
+  plugins/                      ← OpenCode 插件
+    pm-guardian.js              ← Session 追踪 / idle-watch 守护
+    pm-guardian.conf.json       ← 守护插件配置
 ```
 
 ## 设计原则
