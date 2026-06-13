@@ -1,0 +1,69 @@
+# PM System Configuration
+# ========================
+# 通用 PM 调度系统配置模板。
+# Bootstrap 时读取此文件生成项目 pm.config.yaml；
+# 开发者可按需修改生成后的值，bootstrap 不会覆盖已有字段。
+#
+# 版本：v0.1
+# 位置：项目根目录 pm.config.yaml
+
+# ── 项目标识 ──────────────────────────────────
+project:
+  # 项目名（bootstrap 从 implementation_plan.md 首行 H1 推断）
+  name: "{{project_name}}"
+
+# ── Agent 体系 ────────────────────────────────
+agents:
+  # 业务 Agent：pool worktree 串行，实现 / 审查 / 验证
+  dev: "{{dev_agent}}"       # 后端/前端实现 Agent
+  review: "{{review_agent}}" # 代码审查 Agent（P0/P1 零容忍）
+  qa: "{{qa_agent}}"         # 测试验证 Agent
+
+  # PM 域 Agent：main session dispatch
+  gate: "{{gate_agent}}"     # Spec 门禁审查 Agent（可选）
+
+# ── 开发流水线 ────────────────────────────────
+pipeline:
+  # 审查零容忍级别。放行条件 "0 P0 AND 0 P1"
+  review_zero_tolerance: "P0/P1"
+  # Fix 循环最多轮数，超过 → 报告 PM 决策
+  fix_loop_max_rounds: 3
+  # dispatch 脚本失败最多重试次数
+  dispatch_max_retries: 2
+
+# ── Batch 规模阈值 ────────────────────────────
+batch:
+  # 单 Batch 净增+删代码行数上限
+  max_lines: 2000
+  # 单 Batch task 数上限（3-7）
+  max_tasks: 7
+  # 单 Phase PR 数建议上限（避免流水线开销压过开发收益）
+  max_prs_per_phase: 5
+
+# ── 约定 ──────────────────────────────────────
+conventions:
+  # Feature 分支命名前缀
+  branch_prefix: "feat_P"
+  # 是否强制审查（false 时开发者可跳过 Themis/QA）
+  review_required: true
+  # 工具脚本目录
+  tools_dir: "scripts/"
+  # PM 域文档（.pm/ docs/ .opencode/）提交模式：direct（PM 直推）/ pr（走 PR）
+  pm_commit_mode: "direct"
+
+# ── 记忆文件路径 ──────────────────────────────
+memory:
+  # 相对于项目根目录
+  base: ".pm"
+  files:
+    persona: "persona.md"
+    project_memory: "project_memory.md"
+    user_profile: "user_profile.md"
+    user_behavior: "user_behavior.md"
+  chats: "chats"
+  reflections: "reflections"
+
+# ── Phase 来源 ────────────────────────────────
+phases:
+  # 实现计划文档路径
+  source: "docs/implementation_plan.md"
