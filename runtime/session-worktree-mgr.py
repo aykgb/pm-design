@@ -1552,7 +1552,7 @@ def cmd_prepare(args: argparse.Namespace, config: Config) -> None:
     print("用户确认后再发送")
     print(f'{PROG} pool dispatch {wt_id} {agents[0]} --task "..." --yes')
     print()
-    print("（可选：加 --notify-session <PM_SESSION_ID> 自动 idle-watch，或设 $PM_SESSION_ID）")
+    print("（可选：加 --notify-session <PM_ACTIVE_SESSION_ID> 自动 idle-watch，或设 $PM_ACTIVE_SESSION_ID）")
     print()
     print(f"已分配: {wt_id}")
 
@@ -1854,6 +1854,7 @@ def cmd_session_create(args: argparse.Namespace, config: Config) -> None:
         delete_session(config, existing_sid, hard=True)
     session = create_session(config, "main", directory, agent)
     persist_main_session(config, agent, session)
+    watch_session(config, session["id"])
     print(json.dumps({"sessionID": session.get("id"), "agent": agent, "title": title, "directory": str(directory), "status": "created"}, ensure_ascii=False))
 
 
@@ -2720,32 +2721,171 @@ def fetch_last_reply(config: Config, session_id: str, limit: int = 50) -> str | 
 def fetch_session_context(config: Config, session_id: str) -> int:
     """Return the context window tokens used in the session's latest LLM call.
 
-    Reads the last message (``GET /session/{id}/message?limit=1``) and extracts
-    ``input + cache.read`` from the ``step-finish`` part — this is the actual
-    token count that was sent to the model in the most recent call (cached
-    prefix hits included). Distinct from ``session.tokens`` which is cumulative
-    across the whole session lifetime.
+    Reads the last messages (``GET /session/{id}/message?limit=10``) and
+    extracts ``input + cache.read`` from the ``step-finish`` part of the
+    most recent assistant message that actually finished a step. This is the
+    actual token count that was sent to the model in the most recent
+    completed LLM call (cached prefix hits included). Distinct from
+    ``session.tokens`` which is cumulative across the whole session
+    lifetime.
 
-    Returns ``0`` on fetch failure, no step-finish, or empty ``session_id``.
+    The list is sorted by ``time.completed`` (falling back to
+    ``time.created``) descending so the result is robust to whichever
+    chronological order the op-server returns — same pattern as
+    :func:`fetch_last_reply`.
+
+    ``limit=10`` is intentional: a session currently in the middle of a tool
+    call has no ``step-finish`` on its most recent message, but the previous
+    completed LLM call (typically just seconds earlier) does. Returning 0 in
+    that case would cause auto-compact to skip a session that genuinely
+    exceeded the threshold. We walk back at most 10 messages to find the
+    latest ``step-finish``; if none is found, we return 0 (keep the previous
+    behavior of "no step-finish ⇒ no context signal").
+
+    Returns ``0`` on fetch failure, no step-finish in the last 10 messages, or
+    empty ``session_id``.
     """
     if not session_id or session_id == "-":
         return 0
     try:
         data = http_json(
             "GET",
-            f"{config.op_server}/session/{urllib.parse.quote(session_id)}/message?limit=1",
+            f"{config.op_server}/session/{urllib.parse.quote(session_id)}/message?limit=10",
         )
     except SystemExit:
         return 0
     if not isinstance(data, list) or not data:
         return 0
-    for msg in data:
+
+    def msg_time(m: dict[str, Any]) -> int | float:
+        t = m.get("info", {}).get("time", {}) or {}
+        return t.get("completed") or t.get("created") or 0
+
+    for msg in sorted(data, key=msg_time, reverse=True):
         for part in msg.get("parts") or []:
             if part.get("type") == "step-finish":
                 tk = part.get("tokens", {}) or {}
                 cache = tk.get("cache", {}) or {}
                 return int(tk.get("input", 0)) + int(cache.get("read", 0))
     return 0
+
+
+@dataclass
+class CompactResult:
+    """Outcome of an auto-compact attempt.
+
+    Attributes:
+        compacted: True iff a /summarize call was issued AND the call returned
+            a 2xx status. False covers both "context below threshold, no
+            compact needed" and "compact attempted but failed".
+        context_before: Context tokens at decision time (input + cache.read
+            from the latest step-finish). 0 if the pre-check fetch failed.
+        context_after: Always 0. Retained for backward-shape compatibility
+            with the previous (inaccurate) design; see
+            :func:`auto_compact_session` for why a post-compact fetch is
+            racy. The actual post-compact context is fetched by the caller
+            after a follow-up LLM call completes.
+        error: Human-readable error string when ``compacted`` is False because
+            the HTTP call failed or timed out. None otherwise.
+    """
+
+    compacted: bool
+    context_before: int = 0
+    context_after: int = 0
+    error: str | None = None
+
+
+_AUTO_COMPACT_PROVIDER_ID = "opencode"
+_AUTO_COMPACT_MODEL_ID = "deepseek-v4-flash-free"
+
+
+def auto_compact_session(
+    config: Config,
+    session_id: str,
+    directory: str | None,
+    *,
+    threshold: int = 300_000,
+    timeout: int = 60,
+) -> CompactResult:
+    """Compact a session's context if it exceeds ``threshold`` tokens.
+
+    Workflow:
+
+    1. Fetch current context via :func:`fetch_session_context`.
+    2. If the value is 0 (fetch failed or no step-finish in the last 10
+       messages) **or** below ``threshold``, return without compacting as a
+       no-op — caller should fall through to its normal exit path. The 0
+       case is a separate, explicit no-op (not a failure): we have no token
+       count to evaluate, so the only safe action is to skip. See the
+       inline comment above the ``context_before == 0`` check for why this
+       is a primary guard rather than falling through to the
+       ``<= threshold`` branch.
+    3. Otherwise ``POST /session/{id}/summarize?directory=...`` with a fixed
+       body ``{"providerID": "opencode", "modelID": "deepseek-v4-flash-free"}``
+       and a ``timeout``-second HTTP budget. On 2xx, return
+       ``CompactResult(compacted=True, context_before=<pre-context>, ...)``.
+       On SystemExit (HTTP failure / timeout), capture the message and return
+       it as ``error``.
+
+    The provider/model is hardcoded intentionally: per the Phase-1 task spec,
+    auto-compact is a fail-closed safety net for runaway context, not a
+    user-tunable knob. Any new model choice must be reviewed and rolled out
+    with the rest of the workflow configuration.
+
+    ``directory`` is appended as a query string parameter (matching
+    ``_idle_prompt_async`` and other op-server calls) so the summarize call
+    targets the correct worktree the session was bound to.
+
+    **Post-compact context is NOT fetched here.** ``/summarize`` is processed
+    asynchronously by the op-server: a follow-up ``GET /message`` issued
+    immediately after the 2xx return would race the summary pipeline and
+    frequently return the pre-summarize token count. The caller is expected
+    to drive a real LLM call (e.g. a "ping" prompt) on the target session
+    and fetch the context after *that* busy→idle edge, by which time the
+    summary has been folded into the live message history. The
+    ``CompactResult.context_after`` field is therefore always ``0`` after
+    this function returns; it is retained in the dataclass so existing
+    callers can introspect the return shape, but no caller in this codebase
+    reads it.
+    """
+    if not session_id or session_id == "-":
+        return CompactResult(compacted=False, error="invalid session_id")
+    context_before = fetch_session_context(config, session_id)
+    # Explicit no-op for context=0 (fetch failure or no step-finish in the
+    # last 10 messages). Both are observation failures: we have no token
+    # count to compare against ``threshold``, so the only safe call is to
+    # skip the compact. Treating this as a failure (with ``error=`` set)
+    # would force the caller to send a [idle-notify:compact-failed] for a
+    # transient sidecar / network blip, drowning the PM in noise; the
+    # safety net here is a *missed* compact, not a *loud* one. This check
+    # is the primary guard — the ``context_before <= threshold`` below
+    # would also match for the value 0, but relying on that constant
+    # coincidence is fragile (e.g. someone could later introduce a
+    # non-positive sentinel other than 0). Keep the two checks separate
+    # and explicit.
+    if context_before == 0:
+        return CompactResult(compacted=False, context_before=0)
+    if context_before <= threshold:
+        return CompactResult(compacted=False, context_before=context_before)
+    body = {"providerID": _AUTO_COMPACT_PROVIDER_ID, "modelID": _AUTO_COMPACT_MODEL_ID}
+    query_items: list[str] = []
+    if directory:
+        query_items.append("directory=" + urllib.parse.quote(directory, safe=""))
+    query = "?" + "&".join(query_items) if query_items else ""
+    url = f"{config.op_server}/session/{urllib.parse.quote(session_id)}/summarize{query}"
+    try:
+        http_json("POST", url, body, expected=(200, 201, 204), timeout=timeout)
+    except SystemExit as exc:
+        return CompactResult(
+            compacted=False,
+            context_before=context_before,
+            error=f"{exc}",
+        )
+    return CompactResult(
+        compacted=True,
+        context_before=context_before,
+        context_after=0,
+    )
 
 
 def _print_session_rows(
@@ -2808,6 +2948,13 @@ def _print_session_rows(
             updated_ms = sess.get("updated_ms", 0)
             if updated_ms and (int(time.time() * 1000) - updated_ms) > STALE_DISPATCH_MS:
                 sstate += " [STUCK]"
+        # ANSI bold for busy/streaming rows so PM can spot active sessions
+        # at a glance in the terminal table. Gated on isatty() so JSON
+        # output (--format json) and piped consumers do not see raw escape
+        # sequences corrupting their input. sstate.startswith handles the
+        # [STUCK] suffix where the value is e.g. 'busy [STUCK]'.
+        if sys.stdout.isatty() and (sstate.startswith("busy") or sstate.startswith("streaming")):
+            sstate = f"\033[1m{sstate}\033[0m"
         if is_main:
             prefix = f"  {'':<14} {'':<40} {'':<9} {'':<7} {'':<6}"
         else:
@@ -3343,6 +3490,18 @@ _IDLE_WATCH_TIMEOUT_DEFAULT = 10.0
 _IDLE_WATCH_MAX_ERRORS_DEFAULT = 10
 _IDLE_WATCH_STOP_TIMEOUT_DEFAULT = 3.0
 
+# Auto-compact threshold: when a session's most recent step-finish reports
+# ``input + cache.read`` above this number, the idle-watch fires a
+# ``POST /session/{id}/summarize`` after the busy->idle notify and then sends
+# a follow-up notify tagged ``[idle-notify:compact-done|compact-skipped|
+# compact-failed]``. Hardcoded per the Phase-1 spec — no CLI flag, since the
+# intent is a safety net, not a per-task knob. 300K is well below the
+# 200K-token context window of deepseek-v4-flash-free with safety margin, and
+# matches the budget that other toolchain scripts use to flag "context is
+# getting expensive".
+_AUTO_COMPACT_THRESHOLD = 300_000
+_AUTO_COMPACT_HTTP_TIMEOUT = 60
+
 
 def _spawn_dispatch_idle_watch(
     config: Config,
@@ -3469,6 +3628,19 @@ def cmd_idle_watch(args: argparse.Namespace, config: Config) -> None:
     busy_since: float | None = None  # monotonic timestamp when busy/streaming started
     stuck_notified = False  # only fire stuck notification once per busy streak
 
+    # Auto-compact two-phase state:
+    # phase 0 = idle-watch is observing a real user task; busy→idle edge
+    #           triggers the first PM notify, then (if context > threshold)
+    #           issues /summarize + ping + transitions to phase 1.
+    # phase 1 = a ping prompt has been dispatched; the next busy→idle edge
+    #           represents "ping has been folded into the live history", at
+    #           which point we re-fetch context (now accurate) and send the
+    #           second PM notify (compact-done / compact-skipped), then exit.
+    # compact_before carries the pre-summarize context from phase 0 into
+    # phase 1 so the second notify can report the before→after delta.
+    phase = 0
+    compact_before = 0
+
     while True:
         if deadline is not None and time.monotonic() > deadline:
             eprint(f"[idle-watch] max poll seconds ({max_poll_seconds}s) reached; exiting")
@@ -3555,6 +3727,35 @@ def cmd_idle_watch(args: argparse.Namespace, config: Config) -> None:
             notify_reason = "idle after dispatch update"
 
         if should_notify:
+            # Phase 1: ping prompt_async has been folded into the target's
+            # history. Re-fetch context (now accurate — the post-summarize
+            # state is in the live message log) and emit the second notify,
+            # then exit. Race check: a single re-fetched status guards
+            # against a "user dispatched a new task between the ping
+            # completing and us reading the context" scenario, in which case
+            # the context delta would be misleading.
+            if notify_reason == "busy -> idle" and phase == 1:
+                eprint("[idle-watch] phase 1 busy→idle: ping completed; verifying post-compact context")
+                ctx_after = fetch_session_context(config, target)
+                post_status = _idle_fetch_status(config, target)
+                if post_status != "idle":
+                    msg = f"[idle-notify:compact-skipped] target={target} session reused during verify (status={post_status})"
+                    eprint(f"[idle-watch] session reused during verify (status={post_status}); sending compact-skipped")
+                else:
+                    before_k = compact_before // 1000
+                    after_k = ctx_after // 1000
+                    msg = f"[idle-notify:compact-done] target={target} context {before_k}K->{after_k}K"
+                    eprint(f"[idle-watch] sending compact-done: context {before_k}K -> {after_k}K")
+                _idle_prompt_async(
+                    config,
+                    notify,
+                    msg,
+                    directory=getattr(args, "directory", None),
+                    workspace=getattr(args, "workspace", None),
+                    timeout=timeout,
+                )
+                return
+
             eprint(f"[idle-watch] detected {notify_reason}, sending prompt_async to {notify}")
             message_to_send = _build_idle_notify_message(config, target, notify_reason, custom_message)
             ok = _idle_prompt_async(
@@ -3572,6 +3773,79 @@ def cmd_idle_watch(args: argparse.Namespace, config: Config) -> None:
                 if notify_reason == "idle after dispatch update":
                     idle_after_update_notified = True
                 if not continuous:
+                    if notify_reason == "busy -> idle":
+                        # Phase 0 first-notify accepted; now try to compact
+                        # the target's context and prepare a ping so the
+                        # next busy→idle edge is driven by a real LLM call
+                        # (giving the async /summarize pipeline time to
+                        # land in the live history). Below-threshold /
+                        # fetch-failed → silent one-shot exit, matching the
+                        # pre-auto-compact behavior. HTTP failure →
+                        # surface a compact-failed notify so the PM has
+                        # visibility into the safety-net miss.
+                        eprint(f"[idle-watch] phase 0 auto-compact check: target={target} threshold={_AUTO_COMPACT_THRESHOLD}")
+                        result = auto_compact_session(
+                            config,
+                            target,
+                            getattr(args, "directory", None),
+                            threshold=_AUTO_COMPACT_THRESHOLD,
+                            timeout=_AUTO_COMPACT_HTTP_TIMEOUT,
+                        )
+                        if not result.compacted:
+                            if result.error is None:
+                                eprint(f"[idle-watch] auto-compact not needed (context={result.context_before}); exiting (one-shot)")
+                            else:
+                                eprint(f"[idle-watch] auto-compact failed: {result.error}")
+                                fail_msg = f"[idle-notify:compact-failed] target={target} error={result.error}"
+                                _idle_prompt_async(
+                                    config,
+                                    notify,
+                                    fail_msg,
+                                    directory=getattr(args, "directory", None),
+                                    workspace=getattr(args, "workspace", None),
+                                    timeout=timeout,
+                                )
+                            return
+                        compact_before = result.context_before
+                        eprint(f"[idle-watch] compact ok: pre-context={compact_before // 1000}K; sending ping to flush summary into live history")
+                        ping_query: list[str] = []
+                        directory_val = getattr(args, "directory", None)
+                        if directory_val:
+                            ping_query.append("directory=" + urllib.parse.quote(directory_val, safe=""))
+                        ping_q = "?" + "&".join(ping_query) if ping_query else ""
+                        ping_url = f"{config.op_server}/session/{urllib.parse.quote(target)}/prompt_async{ping_q}"
+                        ping_body = {"parts": [{"type": "text", "text": "ping — 确认当前上下文大小"}]}
+                        ping_effective_timeout = int(timeout) if timeout else _IDLE_WATCH_TIMEOUT_DEFAULT
+                        try:
+                            http_json(
+                                "POST",
+                                ping_url,
+                                ping_body,
+                                expected=(204,),
+                                timeout=ping_effective_timeout,
+                            )
+                        except SystemExit as exc:
+                            eprint(f"[idle-watch] ping send failed: {exc}; sending compact-failed")
+                            fail_msg = f"[idle-notify:compact-failed] target={target} error=ping send failed ({exc})"
+                            _idle_prompt_async(
+                                config,
+                                notify,
+                                fail_msg,
+                                directory=getattr(args, "directory", None),
+                                workspace=getattr(args, "workspace", None),
+                                timeout=timeout,
+                            )
+                            return
+                        eprint("[idle-watch] phase 0→1: ping dispatched; waiting for next busy→idle edge to read accurate post-compact context")
+                        phase = 1
+                        # Force the next tick to detect busy→idle: the ping
+                        # has just been queued, so the session is about to
+                        # go busy; setting previous_status="busy" here means
+                        # the next idle observation fires the edge branch.
+                        # We `continue` (not `return`) so the existing poll
+                        # loop re-fetches and observes the transition.
+                        previous_status = "busy"
+                        continue
                     return
 
         previous_status = current_status
@@ -4185,8 +4459,8 @@ def _add_dispatch_options(parser: argparse.ArgumentParser, *, allow_session: boo
     parser.add_argument("--force", action="store_true", help="Hard-delete stuck session and create a fresh one before dispatching.")
     parser.add_argument(
         "--notify-session",
-        default=env("PM_SESSION_ID", ""),
-        help="PM session to notify when target becomes idle. Defaults to $PM_SESSION_ID, then current PM session if available.",
+        default=env("PM_ACTIVE_SESSION_ID", ""),
+        help="PM session to notify when target becomes idle. Defaults to $PM_ACTIVE_SESSION_ID, then current PM session if available.",
     )
     parser.add_argument(
         "--require-no-busy",

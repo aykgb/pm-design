@@ -305,7 +305,21 @@ wt_5  <branch>  <commit>  clean  <Δ>  (无)  ...  (9 unwatch/unknown sessions h
 
 用户想看完整列表（含 unwatch）：`overview --show-unwatch`。
 
-### 7.3 当前差距
+### 7.4 overview 渲染设计
+
+**busy/streaming 加粗**：终端输出中 busy 和 streaming 状态的 session 加粗显示。目的是让运维一眼识别正在执行任务的 session，快速定位资源占用。
+
+**TTY 检测**：加粗仅在终端输出时生效。管道或 JSON 输出不加粗——保证脚本解析不受 ANSI escape 污染。
+
+### 7.5 Context 字段设计
+
+overview 和 `session show` 的 Context 列显示的是 session **最近一次已完成 LLM 调用**的上下文窗口大小，而非 session 生命周期的累计 tokens。
+
+**为什么不用累计值**：`session.tokens.input` 是历次调用的累加和，只增不减。一个复用了 10 次的老 session 累计值可能 500K+，但实际每次调用的上下文窗口只有 150K——累计值不能反映当前状态。
+
+**为什么取最后一次已完成调用**：session 的最后一条 message 可能正在执行 tool call，此时没有 `step-finish`——取这个值无意义。回溯到最近一条已完成的 assistant message 的上下文窗口，才是当前有效值。
+
+**tool call 进行中显示 0**：这是已知局限——不是 bug，是信息缺失。运维应等 busy→idle 后再查。
 
 以实际运行数据为例（2026-06-12）：
 
@@ -331,7 +345,65 @@ wt_5  <branch>  <commit>  clean  <Δ>  (无)  ...  (9 unwatch/unknown sessions h
 | `.pool_rr_index` 丢失 | 重置为 1（wt_1 起扫） |
 | pool lock 被占用 | `fail("another pool operation is running")` |
 
-## 9. 文件索引
+## 10. auto-compact 设计
+
+### 10.1 动机
+
+Main agent session（尤其是 Momus / General）跨多次 spec 拆解和修复循环复用，context 随对话历史不断膨胀。200K+ 后模型推理变慢、token 成本升高、缓存命中率下降。自动 compact 在 session 完成一轮任务后压缩上下文，减少后续派发的冷启动开销。
+
+### 10.2 设计决策
+
+**完整流程**：
+
+```
+busy→idle
+  │
+  ├─ ① [idle-notify:busy->idle] task done     ← 不延迟，立即发
+  │
+  ├─ fetch_session_context → > 300K?
+  │   ├─ No → silent exit
+  │   └─ Yes → POST /summarize (deepseek-v4-flash-free, 60s 超时)
+  │         ├─ 失败 → [idle-notify:compact-failed] {error}, exit
+  │         ├─ OK → POST ping prompt
+  │         │   ├─ 失败 → [idle-notify:compact-failed] ping send failed, exit
+  │         │   └─ OK → 继续 poll loop, 等 busy→idle
+  │         │
+  │         └─ busy→idle (ping 完成)
+  │               ├─ session 非 idle → [idle-notify:compact-skipped] session reused
+  │               └─ session idle → ② [idle-notify:compact-done] {before}K→{after}K
+  └─ exit
+```
+
+**触发时机：busy→idle，而非 dispatch 前。** dispatch 前 compact 会延迟派发——用户在等待。busy→idle 后 compact 在后台完成，不阻塞下一轮任务。代价是 compact 期间 session 被复用需检测竞态。
+
+**两阶段通知：先报 task done，后报 compact result。** 区分"任务完成了"和"压缩完成了"两个事件。第一条不延迟——PM 立刻知道可以下一步。第二条在 compact 完成后发送。
+
+**ping-then-poll 而非直接读 context。** summarize 是 OpenCode 服务端异步操作，POST 返回 `true` 只表示请求已接受，上下文实际压缩在后续 LLM 调用时生效。compact 后发一条 ping prompt，等 busy→idle 再取 context，此时值才准确。
+
+**独立模型，不污染 session。** compact 用 `deepseek-v4-flash-free`（免费轻量），session 自身模型不变。summarize 端点和 prompt_async 端点是独立的——前者压缩消息历史，后者处理用户 prompt。
+
+**阈值 300K，不参数化。** Phase 1 硬编码足够——低于此值 compact 收益小（summarize 本身也有压缩损耗），高于此值收益明显。Phase 2+ 可按 agent 类型差异化（Momus 阈值低于 Daedalus）。
+
+**竞态防御：compact 后查 session status。** PM 可能在第一条 notify 后立刻 dispatch 新任务到同一 session。compact 完成时 session 已 busy——此时不应发 "compact-done" 误导 PM。改为发 "compact-skipped"。
+
+### 10.3 不触发场景
+
+- **continuous 模式**：用于长期监听，不区分单次任务边界
+- **initial-idle**：session 刚创建，无历史 context
+- **idle-after-update**：dispatch 后 session 从未 busy（任务极短），context 无变化
+
+### 10.4 与 session 重建的关系
+
+已有 `MAX_MAIN_SESSION_CONTEXT = 200K` 在 `sessions create` 时触发 session 重建（hard delete + 全新 session）。重建 vs compact 的区别：
+
+| | 重建 | compact |
+|---|---|---|
+| 触发点 | sessions create 时 | busy→idle 后 |
+| 方式 | 删除旧 session，建全新 | 压缩消息历史，保留 session |
+| 上下文 | 完全丢失 | 保留摘要 |
+| 适用 | main agent 长期膨胀 | 所有 session 单次任务后
+
+## 11. 文件索引
 
 | 文件 | 角色 |
 | --- | --- |

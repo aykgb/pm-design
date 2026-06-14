@@ -45,7 +45,7 @@ python3 scripts/session-worktree-mgr.py overview --format json
 wt_5  <branch>  <commit>  clean  <Δ>  (无)  ...  (9 unwatch/unknown sessions hidden; pass --show-unwatch)
 ```
 
-占位让 wt 不再"消失"（pool init 不再预创建 sessions 后，全新 wt 都是 unwatch），同时不强迫用户看噪音。常见成因：wt 从未 dispatch 过、pool release 后 stale、sidecar 重启后未重 watch。
+占位让 wt 不会因为所有 session 被隐藏而"消失"。常见成因：wt 从未 dispatch 过、pool release 后 stale、sidecar 重启后未重 watch。
 
 ### 单个 session
 
@@ -55,6 +55,8 @@ python3 scripts/session-worktree-mgr.py session status ses_xxx
 python3 scripts/session-worktree-mgr.py session last ses_xxx
 python3 scripts/session-worktree-mgr.py session dispatch ses_xxx --task "..." --yes
 ```
+
+> **`session show` Context 字段**：反映 session 最近一次已完成的 LLM 调用的上下文窗口大小。若 session 正在跑 tool call，可能显示 0——此时可等 busy→idle 后再查。
 
 ### 多个 sessions
 
@@ -71,11 +73,17 @@ python3 scripts/session-worktree-mgr.py sessions create --agent Janitor
 python3 scripts/session-worktree-mgr.py pool status --verify
 python3 scripts/session-worktree-mgr.py pool init --size 10
 python3 scripts/session-worktree-mgr.py pool repair wt_1
-python3 scripts/session-worktree-mgr.py pool prepare --branch feat_xxx
-python3 scripts/session-worktree-mgr.py pool dispatch wt_1 Daedalus --task "..." --yes
-python3 scripts/session-worktree-mgr.py pool continue wt_1 Daedalus --yes
+python3 scripts/session-worktree-mgr.py pool prepare --branch feat_xxx [--agents AGENTS] [--force-branch]
+python3 scripts/session-worktree-mgr.py pool dispatch wt_1 Daedalus --task "..." [--yes] [--force]
+python3 scripts/session-worktree-mgr.py pool continue wt_1 Daedalus [--yes]
 python3 scripts/session-worktree-mgr.py pool release wt_1
 ```
+
+**`pool prepare` 注意事项**：
+
+- 只接受 `--branch` / `--agents` / `--force-branch`，**不接受 `--wt`**。
+- 自动 round robin 按 wt_id 顺序选下一个 idle worktree，无须也无法手动指定。
+- 返回分配的 wt_id（如 `wt_6`），后续 `dispatch` / `release` 使用该 wt_id。
 
 ### 服务
 
@@ -84,6 +92,11 @@ python3 scripts/session-worktree-mgr.py service status
 python3 scripts/session-worktree-mgr.py service start all
 python3 scripts/session-worktree-mgr.py service restart sidecar
 ```
+
+### overview 渲染
+
+- **终端输出**：busy / streaming 状态的 session 加粗显示，`[STUCK]` 后缀跟随加粗。
+- **管道 / JSON 输出**：不加粗，纯文本。
 
 ## 标准派发流程
 
@@ -98,6 +111,8 @@ python3 scripts/session-worktree-mgr.py pool status --verify
 ```bash
 python3 scripts/session-worktree-mgr.py pool prepare --branch feat_xxx
 ```
+
+自动 round robin 按 wt_id 顺序选下一个 idle worktree，返回分配的 wt_id。**不接受 `--wt` 手动指定**（commit `58fd78d` 之前的 PM agent 曾误用 `--wt`，已修复）。
 
 **3. 正常任务直接派发：**
 
@@ -146,6 +161,21 @@ python3 scripts/session-worktree-mgr.py pool dispatch wt_1 Daedalus --task "..."
 python3 scripts/session-worktree-mgr.py pool release wt_1
 ```
 
+## auto-compact（idle-watch 自动触发）
+
+dispatch 后 idle-watch 检测到 busy→idle 时，若 session context 超过 300K，自动做 summarize 压缩，完成后通知 PM。
+
+**触发条件**：仅 `busy -> idle` 边沿 + one-shot 模式（`continuous` / `initial-idle` / `idle-after-update` 不触发）。
+
+**通知格式**：
+
+| 场景 | PM 收到的 notify |
+|------|-----------------|
+| context ≤ 300K，不触发 | （无，silent exit） |
+| compact 失败 | `[idle-notify:compact-failed] {error}` |
+| compact 成功 | `[idle-notify:compact-done] {before}K→{after}K` |
+| compact 期间 session 被复用 | `[idle-notify:compact-skipped] session reused` |
+
 ## 何时先预览派发
 
 只有高风险任务才先预览，不加 `--yes`：
@@ -186,6 +216,8 @@ python3 scripts/session-worktree-mgr.py overview --wt wt_1
 
 ## 禁止误推断
 
+### 错误命令形式
+
 不要使用这些错误形式：
 
 ```bash
@@ -203,6 +235,16 @@ python3 scripts/session-worktree-mgr.py session show ses_xxx
 python3 scripts/session-worktree-mgr.py session status ses_xxx
 python3 scripts/session-worktree-mgr.py session last ses_xxx
 ```
+
+### 错误参数形式
+
+不要给以下命令传不存在的参数：
+
+```bash
+python3 scripts/session-worktree-mgr.py pool prepare --branch feat_xxx --wt wt_1  # ❌ pool prepare 不接受 --wt
+```
+
+`pool prepare` 只接受 `--branch` / `--agents` / `--force-branch`。worktree 由 round robin 自动分配，无须手动指定。dispatch 时才传 wt_id 作为位置参数（`pool dispatch wt_1 ...`），不是 `--wt` 选项。
 
 ## 失败恢复
 
@@ -240,6 +282,7 @@ python3 scripts/session-worktree-mgr.py session last ses_xxx
 - stuck-notify 消息含 wt / agent / stale 时长，无需手动查 overview。
 - overview 全局一次 `/session?limit=2000` HTTP 调用，非 per-wt 多次调用。
 - 不确定命令时先执行 `python3 scripts/session-worktree-mgr.py -h` 或对应子命令 `-h`。
+- `pool prepare` 自动 round robin 分配 worktree，**不接受 `--wt`**。`pool dispatch` 的 wt_id 是位置参数（如 `wt_1`），不是 `--wt` 选项。
 - 不要绕过 `pool prepare -> pool dispatch -> pool release` 生命周期。
 - `pool continue` 在已有 wt 上直接派发新 session，不走 `prepare`（branch 已存在）。
 - 修改前先确认 worktree、branch、session id 与 agent 对应关系。
