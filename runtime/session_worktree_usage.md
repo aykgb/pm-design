@@ -39,10 +39,10 @@ python3 scripts/session-worktree-mgr.py overview --show-unwatch
 python3 scripts/session-worktree-mgr.py overview --format json
 ```
 
-**占位行行为**：默认隐藏 unwatch/unknown session 后，若某个 wt 内的 session **全部**被隐藏，overview 会打印一行占位（commit `63d051c`）：
+**占位行行为**：默认隐藏 unwatch session 后，若某个 wt 内的 session **全部**被隐藏，overview 会打印一行占位（commit `63d051c`）：
 
 ```
-wt_5  <branch>  <commit>  clean  <Δ>  (无)  ...  (9 unwatch/unknown sessions hidden; pass --show-unwatch)
+wt_5  <branch>  <commit>  clean  <Δ>  (无)  ...  (9 unwatch sessions hidden; pass --show-unwatch)
 ```
 
 占位让 wt 不会因为所有 session 被隐藏而"消失"。常见成因：wt 从未 dispatch 过、pool release 后 stale、sidecar 重启后未重 watch。

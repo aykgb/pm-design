@@ -298,7 +298,7 @@ watch:
 `overview` 默认隐藏 sidecar 状态为 `unwatch` / `unknown` 的 session（避免视觉噪音）。当某个 wt 内的所有 session **全部**被隐藏时，overview 打印一行占位：
 
 ```
-wt_5  <branch>  <commit>  clean  <Δ>  (无)  ...  (9 unwatch/unknown sessions hidden; pass --show-unwatch)
+wt_5  <branch>  <commit>  clean  <Δ>  (无)  ...  (9 unwatch sessions hidden; pass --show-unwatch)
 ```
 
 占位让 wt 不再"消失"——这是 commit `4eedee3` 之后的关键 UX 改进：全新 wt 的 sessions 都是 unwatch（从未 dispatch 过），默认隐藏后这些 wt 必须靠占位行才能被用户感知。

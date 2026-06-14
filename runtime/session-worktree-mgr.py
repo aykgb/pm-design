@@ -2923,7 +2923,7 @@ def _print_session_rows(
     if not sessions:
         if hidden and not is_main:
             prefix = f"  {wt['id']:<14} {wt['branch']:<40} {wt['commit']:<9} {wt['dirty']:<7} {wt['ahead_main']:<6}"
-            note = f"({hidden} unwatch/unknown session{'s' if hidden != 1 else ''} hidden; pass --show-unwatch)"
+            note = f"({hidden} unwatch session{'s' if hidden != 1 else ''} hidden; pass --show-unwatch)"
             row = f"{prefix} {'(无)':<10} {'':<7} {'':<8} {'':<8} {'':<6} {'':<8} {'':<7} {'':<8} {note}"
             print(row)
         return
