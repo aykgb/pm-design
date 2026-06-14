@@ -325,6 +325,7 @@ export const PMGuardianPlugin = async (context) => {
             const conflict = {
                 allowed: false,
                 action: "conflict",
+                record: nextRecord,
                 currentSessionID: current.current_session_id,
                 requestedSessionID: sessionID,
                 current,
@@ -498,10 +499,6 @@ export const PMGuardianPlugin = async (context) => {
                     input,
                 });
 
-                if (!guard.allowed) {
-                    return output;
-                }
-
                 const beforeSystemHead = previewSystemHead(output.system);
 
                 const sessionInfoInjected = !hasSessionInfo(output.system);
@@ -512,18 +509,21 @@ export const PMGuardianPlugin = async (context) => {
 
                 const injectedInstructs = [];
                 const skippedInstructs = [];
+                let afterSystemHead = beforeSystemHead;
 
-                for (const section of frozenInstructSections) {
-                    if (hasInstructSource(output.system, section.sourceID)) {
-                        skippedInstructs.push(section.configuredPath);
-                        continue;
+                if (guard.allowed) {
+                    for (const section of frozenInstructSections) {
+                        if (hasInstructSource(output.system, section.sourceID)) {
+                            skippedInstructs.push(section.configuredPath);
+                            continue;
+                        }
+
+                        output.system.push(wrapInstruct(section));
+                        injectedInstructs.push(section.configuredPath);
                     }
 
-                    output.system.push(wrapInstruct(section));
-                    injectedInstructs.push(section.configuredPath);
+                    afterSystemHead = previewSystemHead(output.system);
                 }
-
-                const afterSystemHead = previewSystemHead(output.system);
 
                 await logMessage(DEBUG, "Injected PM session/instruct info", {
                     sessionID,
