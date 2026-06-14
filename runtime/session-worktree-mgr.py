@@ -7,15 +7,18 @@ Fixed worktree pool + persistent OpenCode session dispatcher.
 Design:
 - Keep OpenCode API directory = worktree path.
 - Worktrees are long-lived pool resources.
-- pool init/repair performs full warm-up:
-  - create/reuse wt_N
-  - COPY main .opencode/node_modules into wt_N/.opencode/node_modules
-  - create/reuse wt_N-Agent sessions
-  - register sessions to sidecar
-  - persist session ids in .state/wt_N.state
-- prepare only grabs an idle initialized worktree and checks out task branch.
-- dispatch uses session id from state, not title search.
-- release resets worktree and marks idle; it does not delete sessions.
+- pool init/repair creates the wt_N worktrees themselves and synchronizes
+  the .opencode/node_modules from main. Sessions are NOT created at
+  init/repair time — they are created lazily on the first dispatch
+  (``ensure_session(..., recreate_existing=True)``), so unused pool
+  slots do not hold warm OpenCode sessions.
+- prepare grabs an idle worktree and checks out the task branch.
+- dispatch uses session id from state; if the id is missing (first
+  dispatch on a fresh worktree), it creates the session, persists the
+  id, and dispatches — then re-uses the id on subsequent dispatches.
+- release resets the worktree and marks it idle; it does not delete
+  sessions (cleanup_stale_sessions is the only path that evicts state
+  pointers, and it does so only after archiving/unwatching in OpenCode).
 """
 
 from __future__ import annotations
@@ -222,6 +225,65 @@ def http_code(url: str, timeout: int = 2) -> int | None:
 # ---------------- state / git ----------------
 
 
+# Stale-lock thresholds for pool_lock(). Without these, a SIGKILL during a
+# pool op (or an OS-level crash) leaves ``.grab.lock`` behind forever and
+# every subsequent ``pool {init, repair, prepare, release}`` fails with
+# "another pool operation is running". The two-tier check — PID dead OR
+# mtime > 1h — is a conservative auto-recovery: the PID test is the
+# strongest signal, mtime is a fallback for hosts where ``os.kill`` is
+# permission-restricted.
+_POOL_LOCK_STALE_SECONDS = 3600
+
+
+def _pool_lock_break_stale(lock_dir: Path) -> bool:
+    """Return True if a stale ``.grab.lock`` was broken, False otherwise.
+
+    Stale = owner PID is dead AND no live mtime signal, OR mtime is older
+    than ``_POOL_LOCK_STALE_SECONDS``. Best-effort: returns False rather
+    than raising so the caller's normal ``fail("another pool op running")``
+    can fire on a live lock.
+    """
+    pid_path = lock_dir / "pid"
+    try:
+        mtime = lock_dir.stat().st_mtime
+    except OSError:
+        return False
+    stale = False
+    pid_text = ""
+    if pid_path.exists():
+        try:
+            pid_text = pid_path.read_text(encoding="utf-8").strip()
+        except OSError:
+            pid_text = ""
+    if pid_text.isdigit():
+        pid = int(pid_text)
+        try:
+            os.kill(pid, 0)
+            # PID is alive — do not break.
+        except ProcessLookupError:
+            stale = True
+        except PermissionError:
+            # We can't tell from this process; fall through to mtime check.
+            pass
+    if (time.time() - mtime) > _POOL_LOCK_STALE_SECONDS:
+        stale = True
+    if not stale:
+        return False
+    eprint(f"warning: breaking stale pool lock (mtime > {_POOL_LOCK_STALE_SECONDS}s, pid={pid_text or '?'}); another pool op may have crashed")
+    # Remove the lock dir and its pid file together. rmdir() needs the
+    # target to be empty, so unlink the pid first, then rmdir. If rmdir
+    # fails here we don't suppress — the caller will see the original
+    # FileExistsError and can investigate.
+    with contextlib.suppress(FileNotFoundError):
+        pid_path.unlink()
+    try:
+        lock_dir.rmdir()
+    except OSError as exc:
+        eprint(f"warning: failed to rmdir stale lock {lock_dir}: {exc}")
+        return False
+    return True
+
+
 @contextlib.contextmanager
 def pool_lock(config: Config) -> Iterator[None]:
     config.pool_dir.mkdir(parents=True, exist_ok=True)
@@ -229,12 +291,35 @@ def pool_lock(config: Config) -> Iterator[None]:
     try:
         lock_dir.mkdir()
     except FileExistsError:
-        fail(f"another pool operation is running: {lock_dir}")
+        # Try to break a stale lock first (crashed previous op). If the
+        # lock is genuinely live, retry mkdir and fail loudly — never
+        # silently skip a live holder.
+        if _pool_lock_break_stale(lock_dir):
+            try:
+                lock_dir.mkdir()
+            except FileExistsError:
+                fail(f"another pool operation is running: {lock_dir}")
+        else:
+            fail(f"another pool operation is running: {lock_dir}")
+    # Record the holder PID inside the lock dir. On a clean release we
+    # unlink the pid then rmdir the dir; on a SIGKILL the pid file plus
+    # lock dir are both left behind, which ``_pool_lock_break_stale``
+    # will detect via dead-PID OR mtime on the next acquire.
+    try:
+        (lock_dir / "pid").write_text(str(os.getpid()), encoding="utf-8")
+    except OSError as exc:
+        eprint(f"warning: failed to record lock holder pid: {exc}")
     try:
         yield
     finally:
-        with contextlib.suppress(OSError):
+        with contextlib.suppress(FileNotFoundError):
+            (lock_dir / "pid").unlink()
+        try:
             lock_dir.rmdir()
+        except OSError as exc:
+            # Don't swallow: a future acquire needs to know the prior
+            # holder exited uncleanly so it can break the stale lock.
+            eprint(f"warning: failed to release pool lock {lock_dir}: {exc}")
 
 
 def state_dir(config: Config) -> Path:
@@ -268,9 +353,27 @@ def _read_state_file(path: Path) -> dict[str, str]:
 
 
 def _write_state_file(path: Path, values: dict[str, str]) -> None:
-    """Write a standard ``key=value`` state file at an explicit path."""
+    """Write a standard ``key=value`` state file at an explicit path.
+
+    Atomic via temp-file + ``os.replace()``: writes to ``<path>.tmp`` first
+    and then renames over the target, so a concurrent ``update_state()`` from
+    a parallel dispatch cannot truncate the file mid-write. ``os.replace`` is
+    atomic on POSIX and Windows when the source and destination are on the
+    same filesystem.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("".join(f"{k}={v}\n" for k, v in values.items()), encoding="utf-8")
+    payload = "".join(f"{k}={v}\n" for k, v in values.items())
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    tmp_path.write_text(payload, encoding="utf-8")
+    try:
+        os.replace(tmp_path, path)
+    except OSError:
+        # Best-effort cleanup of the orphan tmp file before re-raising.
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
 
 
 def write_state(config: Config, wt_id: str, values: dict[str, str]) -> None:
@@ -419,6 +522,22 @@ def branch_exists(repo: Path, branch: str) -> bool:
     )
 
 
+def _branch_tip(repo: Path, ref: str) -> str:
+    """Return the commit SHA at ``ref`` (empty string on lookup failure)."""
+    res = git(repo, "rev-parse", "--verify", ref, capture=True, check=False)
+    return res.stdout.strip() if res.returncode == 0 else ""
+
+
+def branch_tip_equals_base(repo: Path, branch: str, base_ref: str) -> bool:
+    """True when ``refs/heads/<branch>`` and ``<base_ref>`` resolve to the
+    same commit SHA. Used by ``checkout_task_branch`` to decide whether
+    ``git reset --hard <base_ref>`` is a safe no-op (same commit) or a
+    destructive operation that would discard commits the user made on the
+    branch.
+    """
+    return bool(_branch_tip(repo, f"refs/heads/{branch}") and _branch_tip(repo, f"refs/heads/{branch}") == _branch_tip(repo, base_ref))
+
+
 def remote_branch_exists(repo: Path, remote_branch: str) -> bool:
     return (
         git(
@@ -462,7 +581,21 @@ def checkout_task_branch(path: Path, repo: Path, branch: str, base_ref: str, *, 
     validate_new_branch(repo, branch, allow_existing=allow_existing)
     reset_to_base(path, base_ref)
     if allow_existing and branch_exists(repo, branch):
+        if not branch_tip_equals_base(repo, branch, base_ref):
+            # Refuse to ``git reset --hard`` when the branch has commits
+            # the user made — that would silently destroy work. Force the
+            # user to either rebase/merge into base, delete the branch, or
+            # pick a new branch name.
+            tip = _branch_tip(repo, f"refs/heads/{branch}")[:12]
+            fail(
+                f"branch {branch} already has commits not in {base_ref} "
+                f"(tip {tip}). Refusing to reset --hard to avoid losing work. "
+                f"Either rebase/merge {branch} onto {base_ref}, delete the "
+                f"branch with `git branch -D {branch}`, or pick a new name."
+            )
         git(path, "checkout", branch)
+        # Branch tip == base_ref: reset --hard is a no-op, kept for clarity
+        # so the worktree index matches the branch tip exactly.
         git(path, "reset", "--hard", base_ref)
     else:
         git(path, "checkout", "-b", branch, "--no-track", base_ref)
@@ -610,8 +743,8 @@ def delete_session(config: Config, session_id: str, *, hard: bool = False) -> No
 
 
 STALE_SESSION_MS_DEFAULT = 24 * 60 * 60 * 1000  # 1 day
-STALE_DISPATCH_MS = 15 * 60 * 1000  # 15 min — auto-recover stuck dispatch sessions
-MAX_MAIN_SESSION_CONTEXT = 200_000  # rebuild main agent session when context exceeds this
+STALE_DISPATCH_MS = 10 * 60 * 1000  # 10 min — auto-recover stuck dispatch sessions
+MAX_MAIN_SESSION_CONTEXT = 300_000  # auto-compact main agent session when context exceeds this (>1d → rebuild)
 
 # Default recent window for `cmd_overview` and `rewatch_all_sessions`.
 # Sessions whose `time.updated` is older than this are filtered out unless
@@ -749,8 +882,10 @@ def cleanup_stale_sessions(
     tombstone set does not grow unbounded.
     """
     state = read_state(config, wt_id)
-    cleaned: list[tuple[str, str]] = []
-    alive_checked: set[str] = set()
+    # Collect every sid we need to look up: state-pinned + tombstoned
+    # (the tombstone set may include sids from prior ``sessions delete``
+    # invocations that the state file is still tracking).
+    pinned_sids: dict[str, str] = {}  # sid -> "<agent>_session_id" key
     for key in list(state.keys()):
         if not key.endswith("_session_id"):
             continue
@@ -760,17 +895,59 @@ def cleanup_stale_sessions(
             state.pop(key, None)
             state.pop(f"{agent}_session_title", None)
             continue
+        pinned_sids[sid] = key
+    tombstoned = _tombstoned_sids(state)
+    all_sids_to_check = set(pinned_sids) | tombstoned
+
+    # Batch lookup: one ``GET /session?limit=N`` covers every sid we care
+    # about (state-pinned and tombstoned) instead of N round-trips. Falls
+    # back to per-sid ``GET /session/{id}`` for any sid the bulk listing
+    # did not return — e.g. sessions older than the listing window.
+    sessions_by_sid: dict[str, dict[str, Any]] = {}
+    if all_sids_to_check:
         try:
-            ses = http_json(
-                "GET",
-                f"{config.op_server}/session/{urllib.parse.quote(sid)}",
-            )
-        except SystemExit:
+            all_listed = sessions(config, limit=_OVERVIEW_SESSION_LIMIT)
+        except SystemExit as exc:
+            eprint(f"warning: cleanup_stale_sessions bulk fetch failed: {exc}; falling back to per-sid lookups")
+            all_listed = []
+        for item in all_listed:
+            sid = str(item.get("id") or "")
+            if sid and sid in all_sids_to_check:
+                sessions_by_sid[sid] = item
+        missing = all_sids_to_check - set(sessions_by_sid)
+        for sid in missing:
+            try:
+                item = http_json(
+                    "GET",
+                    f"{config.op_server}/session/{urllib.parse.quote(sid)}",
+                )
+            except SystemExit:
+                continue
+            if isinstance(item, dict):
+                sessions_by_sid[sid] = item
+
+    cleaned: list[tuple[str, str]] = []
+    for sid, key in pinned_sids.items():
+        agent = key[: -len("_session_id")]
+        ses = sessions_by_sid.get(sid)
+        if not ses:
+            # State has a pinned sid but OpenCode doesn't list it (or the
+            # bulk fetch failed for it) — leave the state pointer alone so
+            # the next ``pool dispatch`` auto-create on a known-missing
+            # sid can run the ensure_session path explicitly. Archive
+            # is only safe when we have proof the session still exists.
             continue
-        if not isinstance(ses, dict):
-            continue
-        alive_checked.add(sid)
         if is_session_stale(ses, max_age_ms):
+            # Archive/unwatch the stale session in OpenCode + sidecar so
+            # the dead pointer does not keep a watch slot warm.
+            # hard=False preserves the OpenCode session record for
+            # history/inspection. Failures are best-effort: if the
+            # sidecar is down we still evict the state pointer to
+            # prevent zombie dispatch.
+            try:
+                delete_session(config, sid, hard=False)
+            except SystemExit:
+                pass
             state.pop(key, None)
             state.pop(f"{agent}_session_title", None)
             cleaned.append((agent, sid))
@@ -779,19 +956,8 @@ def cleanup_stale_sessions(
     # invocations. Best-effort — failures are silently dropped (the next
     # cleanup cycle retries).
     pruned = False
-    tombstoned = _tombstoned_sids(state)
     if tombstoned:
-        alive: set[str] = set(alive_checked)
-        for sid in tombstoned - alive_checked:
-            try:
-                ses = http_json(
-                    "GET",
-                    f"{config.op_server}/session/{urllib.parse.quote(sid)}",
-                )
-            except SystemExit:
-                continue
-            if isinstance(ses, dict):
-                alive.add(sid)
+        alive = {sid for sid in tombstoned if sid in sessions_by_sid}
         keep = tombstoned & alive
         if keep != tombstoned:
             state["deleted_session_ids"] = ",".join(sorted(keep)) if keep else ""
@@ -851,13 +1017,14 @@ def ensure_session(
         ``max_age_ms`` are ARCHIVED (unwatched, left in OpenCode for later
         inspection — cache is cold, conversation history is no longer useful)
         and a fresh session is created instead. This is the "grab-time
-        refresh" behavior used by ``ensure_pool_sessions``.
+        refresh" behavior — see ``cmd_pool_repair_stuck`` for the current
+        caller.
 
     With ``recreate_existing=True``, ANY existing session (state-pinned or
         title-found) is archived first (unwatched, left in OpenCode) and a
         fresh session is created. This is the "always-fresh" behavior used by
         ``cmd_dispatch`` auto-create fallback (cold-start context on first
-        use) and by ``pool continue`` to reset a stuck session. Per-dispatch
+        use) and by ``pool repair_stuck`` to reset a stuck session. Per-dispatch
         loops within the same task still reuse the session — dispatch only
         calls ``ensure_session(recreate_existing=True)`` when the existing
         sid is missing or stale.
@@ -885,7 +1052,17 @@ def ensure_session(
             else:
                 return item
         else:
+            # State has a pinned sid but OpenCode no longer knows it (e.g.
+            # user hard-deleted the session, or the worktree was moved).
+            # The title-search fallback exists for "state was lost" (no
+            # sid at all); here we DO have a sid, it just doesn't exist
+            # in OpenCode anymore — title-search would either find a
+            # different (possibly stale) session or waste an HTTP call.
+            # Skip the fallback and create a fresh session directly.
             eprint(f"stale state session id archived: {agent} {state_sid}")
+            if not recreate_missing:
+                fail(f"missing session for {title}; run pool repair {wt_id}")
+            return create_session(config, wt_id, wt_path, agent)
     item = find_session_by_title(config, title, wt_path)
     if item and str(item.get("id", "")) in tombstoned:
         # Soft-deleted via ``sessions delete`` (no ``--hard``): the title
@@ -977,11 +1154,44 @@ def log_file(config: Config, name: str) -> Path:
     return config.log_dir / f"{name}.log"
 
 
+def _write_pid_file(path: Path, pid: int) -> None:
+    """Atomically write a PID to ``path`` via tmp + os.replace.
+
+    Without this, a crashed mid-write (e.g. SIGKILL during ``write_text``)
+    can leave a partial numeric string that ``int(...)`` happily parses as
+    a different — possibly live — PID, which would then receive
+    ``SIGTERM``/``SIGKILL`` from ``cmd_idle_watch_stop``. ``os.replace`` is
+    atomic on POSIX for files in the same directory, so callers either see
+    the previous valid value or the new valid value, never a partial write.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp")
+    tmp_path.write_text(str(pid), encoding="utf-8")
+    try:
+        os.replace(tmp_path, path)
+    except OSError:
+        # Best-effort cleanup of the orphan tmp file before re-raising so
+        # the caller (and the next acquire) doesn't see a stale .tmp.
+        with contextlib.suppress(OSError):
+            tmp_path.unlink()
+        raise
+
+
 def read_pid(path: Path) -> int | None:
     if not path.exists():
         return None
     try:
-        return int(path.read_text(encoding="utf-8").strip())
+        raw = path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    # Reject partial writes (e.g. "12" from a crashed write_text) and any
+    # non-pure-digit content. Without this, a truncated PID file would
+    # parse as the wrong number and ``pid_alive`` would happily return
+    # True for an unrelated live process.
+    if not raw or not raw.isdigit():
+        return None
+    try:
+        return int(raw)
     except ValueError:
         return None
 
@@ -1153,9 +1363,10 @@ def cmd_opencode_serve_service(args: argparse.Namespace, config: Config) -> None
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
-            op_pid_file.write_text(str(proc.pid), encoding="utf-8")
+            _write_pid_file(op_pid_file, proc.pid)
             if not wait_until(lambda: op_healthy(config)):
                 fail(f"OpenCode Server did not become healthy; log={log_file(config, 'opencode-server')}")
+            eprint(f"OpenCode Server: started pid={proc.pid}")
             eprint(f"OpenCode Server: started pid={proc.pid}")
         else:
             eprint("OpenCode Server: already healthy")
@@ -1218,7 +1429,7 @@ def cmd_sidecar_service(args: argparse.Namespace, config: Config) -> None:
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
-            sidecar_pid_file.write_text(str(proc.pid), encoding="utf-8")
+            _write_pid_file(sidecar_pid_file, proc.pid)
             if not wait_until(lambda: sidecar_healthy(config)):
                 fail(f"Status Sidecar did not become healthy; log={log_file(config, 'session-status-server')}")
             eprint(f"Status Sidecar: started pid={proc.pid}")
@@ -1251,17 +1462,16 @@ def repair_one(
     *,
     reset: bool,
     force_copy: bool,
-    create_sessions: bool = False,
 ) -> dict[str, Any]:
     """Create or repair a single worktree (physical + state).
 
-    Both current call sites pass ``create_sessions=False``: ``pool init``
-    and ``pool repair`` (after commit ``16abebf``) only produce the wt
-    directory, the ``.opencode/node_modules`` copy, and the state file
+    Both current call sites (``pool init`` and ``pool repair``, after
+    commit ``16abebf``) only produce the wt directory, the
+    ``.opencode/node_modules`` copy, and the state file
     (``initialized=1``). Sessions are created lazily by ``cmd_dispatch``
-    auto-create on first use. The parameter is retained for future
-    flexibility — e.g. a hypothetical ``pool prewarm`` command that wants
-    to pre-create sessions for all agents without forcing a dispatch.
+    auto-create on first use — the ``agents`` argument is retained for
+    ``cmd_pool_init``'s default-agents check and the result-row
+    compatibility, but is no longer iterated for session creation.
 
     Skipping session creation at init/repair time avoids leaving unused
     preallocated sessions on every freshly initialized wt (they showed up
@@ -1270,6 +1480,7 @@ def repair_one(
     dispatch utilization was uneven across agents per wt, so a typical wt
     ended up with 2-3 sessions that never saw a single prompt.
     """
+    del agents  # intentionally unused: sessions are created lazily on dispatch
     validate_wt_id(wt_id)
     wt_path = create_or_reuse_worktree(config, wt_id)
     if reset:
@@ -1288,83 +1499,7 @@ def repair_one(
         }
     )
     write_state(config, wt_id, state)
-    session_results: list[dict[str, Any]] = []
-    if not create_sessions:
-        return {"wt_id": wt_id, "wt_path": str(wt_path), "sessions": session_results}
-    for agent in agents:
-        session = ensure_session(config, wt_id, wt_path, agent, recreate_missing=True)
-        persist_session(config, wt_id, agent, session)
-        provider_id, model_id, variant = opencode_model(config, agent)
-        model_label = f"{provider_id}/{model_id}" + (f":{variant}" if variant else "")
-        session_results.append(
-            {
-                "agent": agent,
-                "sessionID": session.get("id"),
-                "title": session.get("title"),
-                "directory": session.get("directory"),
-                "model": model_label,
-            }
-        )
-    return {"wt_id": wt_id, "wt_path": str(wt_path), "sessions": session_results}
-
-
-def validate_pool_sessions(config: Config, wt_id: str, agents: list[str]) -> None:
-    state = read_state(config, wt_id)
-    wt_path = Path(state.get("wt_path") or path_for_wt(config, wt_id)).resolve()
-    if state.get("initialized") != "1":
-        fail(f"{wt_id} is not initialized; run pool repair {wt_id}")
-    if state.get("node_modules_mode") != "copy":
-        fail(f"{wt_id} node_modules is not copy mode; run pool repair {wt_id} --force-copy")
-    assert_worktree_root(wt_path)
-    for agent in agents:
-        sid = state.get(f"{agent}_session_id")
-        if not sid:
-            fail(f"{wt_id} missing {agent}_session_id; run pool repair {wt_id}")
-        if not get_session_by_id(config, sid, directory=wt_path):
-            fail(f"{wt_id} stale {agent}_session_id={sid}; run pool repair {wt_id}")
-
-
-def ensure_pool_sessions(
-    config: Config,
-    wt_id: str,
-    wt_path: Path,
-    agents: list[str],
-    *,
-    recreate_stale: bool = True,
-    recreate_always: bool = False,
-) -> list[dict[str, Any]]:
-    """Ensure each agent has a valid session — create if missing or stale.
-
-    Used by ``cmd_pool_repair`` (which sets ``recreate_always=True`` to
-    batch-precreate one fresh session per agent on the freshly initialized
-    wt). NOT called by ``cmd_prepare`` anymore — prepare moved session
-    creation to ``cmd_dispatch`` (auto-create on first use).
-
-    With ``recreate_stale=True`` (default), sessions older than
-    ``STALE_SESSION_MS_DEFAULT`` (1 day) are archived (unwatched, left in
-    OpenCode for later inspection — cache is cold, conversation history is
-    no longer useful) and a fresh session is created instead.
-
-    With ``recreate_always=True`` (used by ``cmd_pool_repair``), every
-    existing session is archived first and a fresh one created. This
-    guarantees no cross-task session reuse — a fresh task starts with a
-    cold cache and zero history from previous tasks. Per-dispatch loops
-    within the same task still reuse the session.
-    """
-    results: list[dict[str, Any]] = []
-    for agent in agents:
-        session = ensure_session(
-            config,
-            wt_id,
-            wt_path,
-            agent,
-            recreate_missing=True,
-            recreate_stale=recreate_stale,
-            recreate_existing=recreate_always,
-        )
-        persist_session(config, wt_id, agent, session)
-        results.append(session)
-    return results
+    return {"wt_id": wt_id, "wt_path": str(wt_path), "sessions": []}
 
 
 def cmd_pool_init(args: argparse.Namespace, config: Config) -> None:
@@ -1392,7 +1527,6 @@ def cmd_pool_init(args: argparse.Namespace, config: Config) -> None:
                     agents,
                     reset=args.reset,
                     force_copy=args.force_copy,
-                    create_sessions=False,
                 )
             )
     print(json.dumps({"pool_dir": str(config.pool_dir), "results": results}, ensure_ascii=False, indent=2))
@@ -1425,7 +1559,6 @@ def cmd_pool_repair(args: argparse.Namespace, config: Config) -> None:
             agents,
             reset=args.reset,
             force_copy=args.force_copy,
-            create_sessions=False,
         )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
@@ -1475,13 +1608,25 @@ def _read_rr_index(config: Config) -> int:
 
 
 def _write_rr_index(config: Config, idx: int) -> None:
+    """Atomically persist the round-robin pointer; warn (not swallow) on failure.
+
+    A silent failure here would cause every subsequent ``find_idle_wt`` to
+    reset to ``wt_1`` even when other slots are idle, undoing the pool
+    distribution without any user-visible signal. Use the same tmp +
+    os.replace pattern as the state-file writer so concurrent readers
+    never see a partial index.
+    """
     path = state_dir(config) / _RR_STATE_FILENAME
+    state_dir(config).mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f".{path.name}.tmp")
     try:
-        state_dir(config).mkdir(parents=True, exist_ok=True)
-        path.write_text(str(idx))
-    except OSError:
-        # Best-effort: if we cannot persist, the next call resets to wt_1.
-        pass
+        tmp_path.write_text(str(idx), encoding="utf-8")
+        os.replace(tmp_path, path)
+    except OSError as exc:
+        # Best-effort cleanup of the orphan tmp file before warning.
+        with contextlib.suppress(OSError):
+            tmp_path.unlink()
+        eprint(f"warning: failed to persist RR index ({exc}); next call resets to wt_1")
 
 
 def find_idle_wt(config: Config) -> tuple[str, Path]:
@@ -1513,9 +1658,9 @@ def cmd_prepare(args: argparse.Namespace, config: Config) -> None:
     Sessions are created lazily by ``cmd_dispatch`` (auto-create on first
     use, recreate_existing=True for cold-start context) or explicitly via
     ``pool repair``. ``pool prepare`` is now scoped to wt state only:
-    pick idle wt, checkout branch, mark busy. No ensure_pool_sessions
-    call — that responsibility moved to dispatch so pool init / prepare
-    no longer pre-allocate unused sessions.
+    pick idle wt, checkout branch, mark busy. Session pre-allocation was
+    dropped so pool init / prepare no longer leaves unused sessions in
+    the sidecar watch table.
 
     Each prepare generates a fresh ``task_marker`` (uuid4 hex) into the wt
     state. ``cmd_dispatch`` compares this against the agent's stored
@@ -1557,16 +1702,19 @@ def cmd_prepare(args: argparse.Namespace, config: Config) -> None:
     print(f"已分配: {wt_id}")
 
 
-def render_prompt(wt_dir: Path, task: str) -> str:
-    return f"""Assigned worktree: {wt_dir}
+def render_prompt(wt_dir: Path, task: str, *, config: Config) -> str:
+    is_main = wt_dir == config.repo
+    header = f"<!-- wt: {wt_dir.name} -->" if not is_main else "<!-- wt: main -->"
+    return f"""{header}
 
-任务：
 {task}
 
-执行约束：
-- 按 workflow 完成任务
-- 修改前先读目标文件和关联文件，不对路径、签名、契约做假设
-- 遇到阻塞不绕行，立即报告 blocker 与原因
+---
+⚠️ 硬约束：
+
+- 按 workflow 完成任务——不跳过 Checking / Testing / PR 步骤
+- 修改前先读目标文件和关联文件——禁止对路径/签名/契约做假设
+- 遇到阻塞不绕行——立即报告 blocker 与原因，禁止用 workaround/暂不确定/能跑就行为托词
 """
 
 
@@ -1655,7 +1803,7 @@ def cmd_dispatch(args: argparse.Namespace, config: Config) -> None:
                 "reason": reason,
                 "model": model_label,
                 "directory": str(wt_path),
-                "prompt": render_prompt(wt_path, args.task.strip()),
+                "prompt": render_prompt(wt_path, args.task.strip(), config=config),
             }
             print(json.dumps(preview, ensure_ascii=False, indent=2))
             print()
@@ -1668,12 +1816,12 @@ def cmd_dispatch(args: argparse.Namespace, config: Config) -> None:
     session_status = "unknown"
     if isinstance(status_map, dict):
         session_status = str(status_map.get(sid, "unknown"))
-    if args.require_no_busy and session_status != "idle":
-        fail(f"session {sid} not dispatchable: {session_status} (--require-no-busy requires idle)")
+    if args.require_no_busy and session_status in ("busy", "streaming"):
+        fail(f"session {sid} not dispatchable: {session_status} (--require-no-busy rejects busy/streaming)")
     if session_status in ("busy", "streaming"):
         force_recover = getattr(args, "force", False)
         if not force_recover:
-            # Auto-recover if session has been stuck > 15 min
+            # Auto-recover if session has been stuck > 10 min
             ses = get_session_by_id(config, sid, directory=wt_path)
             if ses and is_session_stale(ses, max_age_ms=STALE_DISPATCH_MS):
                 force_recover = True
@@ -1699,7 +1847,7 @@ def cmd_dispatch(args: argparse.Namespace, config: Config) -> None:
         else:
             fail(f"session {sid} is not dispatchable: {session_status} (use --force to hard-delete stuck session)")
     provider_id, model_id, variant = opencode_model(config, agent)
-    prompt = render_prompt(wt_path, args.task.strip())
+    prompt = render_prompt(wt_path, args.task.strip(), config=config)
     body: dict[str, Any] = {
         "agent": agent,
         "model": prompt_model(provider_id, model_id),
@@ -1739,7 +1887,7 @@ def cmd_dispatch(args: argparse.Namespace, config: Config) -> None:
     dispatch_started_at_ms = int(time.time() * 1000)
     http_json("POST", url, body, expected=(204,))
     if args.session:
-        persist_main_session(config, agent, ses)
+        persist_main_session(config, agent, ses)  # type: ignore
     disp_label = f"{wt_id}-{agent}" if not args.session else f"main-{agent}"
     print(f"dispatched -> {disp_label} ({sid}) status=accepted model={model_label} directory={wt_path}")
     notify_sid = args.notify_session or config.pm_session_id
@@ -1819,9 +1967,11 @@ def cmd_session_create(args: argparse.Namespace, config: Config) -> None:
     cross-conversation context leak.
 
     By default idempotent: returns existing non-stale session if one exists.
-    Sessions are rebuilt when context exceeds ``MAX_MAIN_SESSION_CONTEXT``
-    (200K tokens) or age exceeds 1 day.  ``--force`` hard-deletes the existing
-    session and creates a fresh one unconditionally.
+    Sessions are rebuilt when age exceeds 1 day.  When context exceeds
+    ``MAX_MAIN_SESSION_CONTEXT`` (300K tokens) but the session is younger
+    than 1 day, auto-compact is attempted first (summarize + ping → reuse).
+    ``--force`` hard-deletes the existing session and creates a fresh one
+    unconditionally.
     """
     check_services(config)
     agent = args.agent
@@ -1838,11 +1988,24 @@ def cmd_session_create(args: argparse.Namespace, config: Config) -> None:
     if existing_sid and not args.force:
         ses = get_session_by_id(config, existing_sid, directory=directory)
         if ses and not is_session_stale(ses):
-            # Check context bloat — rebuild if context window exceeds threshold
+            # Check context bloat — auto-compact if above threshold but session
+            # is fresh (<1d); only rebuild when the session is actually stale.
             ctx = fetch_session_context(config, existing_sid)
             if ctx > MAX_MAIN_SESSION_CONTEXT:
-                eprint(f"context exceeded ({ctx // 1000}K > {MAX_MAIN_SESSION_CONTEXT // 1000}K): rebuilding {agent} {existing_sid}")
-                delete_session(config, existing_sid)
+                eprint(f"context exceeded ({ctx // 1000}K > {MAX_MAIN_SESSION_CONTEXT // 1000}K): auto-compacting {agent} {existing_sid}")
+                result = auto_compact_session(config, existing_sid, directory, threshold=_AUTO_COMPACT_THRESHOLD, timeout=_AUTO_COMPACT_HTTP_TIMEOUT)  # type: ignore
+                if result.compacted:
+                    after = fetch_session_context(config, existing_sid)
+                    eprint(f"auto-compact ok: context {ctx // 1000}K → {after // 1000}K; reusing {agent} {existing_sid}")
+                    print(json.dumps({"sessionID": existing_sid, "agent": agent, "title": title, "directory": str(directory), "status": "existing"}, ensure_ascii=False))
+                    return
+                # compact failed — user-initiated rebuild, hard-delete the
+                # bloated session so the new create_session() starts from a
+                # clean OpenCode record. A soft delete here would leave a
+                # tombstoned sid in the main.state and re-prompt the same
+                # auto-compact path on the next sessions create.
+                eprint(f"auto-compact failed ({result.error}); rebuilding {agent} {existing_sid} (hard-delete)")
+                delete_session(config, existing_sid, hard=True)
             else:
                 print(json.dumps({"sessionID": existing_sid, "agent": agent, "title": title, "directory": str(directory), "status": "existing"}, ensure_ascii=False))
                 return
@@ -1852,6 +2015,12 @@ def cmd_session_create(args: argparse.Namespace, config: Config) -> None:
     elif existing_sid and args.force:
         eprint(f"force: deleting existing session: {agent} {existing_sid}")
         delete_session(config, existing_sid, hard=True)
+    elif args.force and not existing_sid:
+        # ``--force`` is a no-op when there's nothing to delete. Surface
+        # the no-op rather than silently creating a fresh session — the
+        # user explicitly asked for "force-replace" semantics and we
+        # should be honest about the empty prior state.
+        eprint("note: --force ignored: no existing session in state")
     session = create_session(config, "main", directory, agent)
     persist_main_session(config, agent, session)
     watch_session(config, session["id"])
@@ -1878,16 +2047,10 @@ def _main_state_file(config: Config) -> Path:
 
 
 def read_main_state(config: Config) -> dict[str, str]:
-    path = _main_state_file(config)
-    if not path.exists():
-        return {}
-    data: dict[str, str] = {}
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, value = line.split("=", 1)
-        data[key] = value
-    return data
+    # Reuse the canonical key=value parser so wt_N.state and per-PM
+    # main.state share one implementation. Kept as a thin shim because
+    # _read_state_file is also called directly for non-PM-scoped paths.
+    return _read_state_file(_main_state_file(config))
 
 
 def build_pm_session_map(config: Config) -> dict[str, tuple[str, bool]]:
@@ -1911,8 +2074,12 @@ def build_pm_session_map(config: Config) -> dict[str, tuple[str, bool]]:
 
 
 def write_main_state(config: Config, values: dict[str, str]) -> None:
-    state_dir(config).mkdir(parents=True, exist_ok=True)
-    _main_state_file(config).write_text("".join(f"{k}={v}\n" for k, v in values.items()), encoding="utf-8")
+    # Route through _write_state_file (tmp + os.replace) so concurrent
+    # update_main_state() / _add_tombstone() cannot lose patches via a
+    # non-atomic read-modify-write on the per-PM main.state file.
+    path = _main_state_file(config)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _write_state_file(path, values)
 
 
 def update_main_state(config: Config, patch: dict[str, str]) -> dict[str, str]:
@@ -2224,7 +2391,13 @@ def enrich_worktree_status(wt: dict[str, str]) -> None:
     except subprocess.CalledProcessError:
         wt["dirty"] = "?"
     try:
-        ahead = git(Path(wt_path), "rev-list", "--count", "HEAD...origin/main", capture=True).stdout.strip()
+        # ``origin/main..HEAD`` is the count of commits reachable from HEAD
+        # but not from origin/main — i.e. how far ahead this worktree is
+        # over the fetched ``main``. The previous ``HEAD...origin/main``
+        # triple-dot is the symmetric difference (ahead + behind), which
+        # grows forever as main advances and is not what ``ahead_main``
+        # claims to show.
+        ahead = git(Path(wt_path), "rev-list", "--count", "origin/main..HEAD", capture=True).stdout.strip()
         wt["ahead_main"] = ahead
     except subprocess.CalledProcessError:
         wt["ahead_main"] = "?"
@@ -2637,6 +2810,9 @@ def collect_overview(
                 verbose=verbose,  # --verbose 控 unlisted-agent warning
             )
             # Cap PM groups to current + the newest historical PM states.
+            # Tagged historical PM (pm_session_id != "") outranks orphan (pm_sid="")
+            # so a tagged PM with older ``updated_ms`` is not displaced by a newer
+            # orphan that ``_PM_STATE_HISTORY_LIMIT_DEFAULT`` could not tag.
             pm_items = [it for it in kept_indexed if _is_pm_agent(it.get("agent"))]
             pm_groups: dict[str, list[dict[str, Any]]] = {}
             for it in pm_items:
@@ -2648,6 +2824,7 @@ def collect_overview(
                     pm_groups.items(),
                     key=lambda kv: (
                         0 if any(i.get("pm_current") for i in kv[1]) else 1,
+                        0 if kv[0] else 1,  # tagged PM outranks orphan (pm_sid != "")
                         -max(int(i.get("updated_ms", 0)) for i in kv[1]),
                     ),
                 )
@@ -2954,7 +3131,11 @@ def _print_session_rows(
         # sequences corrupting their input. sstate.startswith handles the
         # [STUCK] suffix where the value is e.g. 'busy [STUCK]'.
         if sys.stdout.isatty() and (sstate.startswith("busy") or sstate.startswith("streaming")):
-            sstate = f"\033[1m{sstate}\033[0m"
+            raw = sstate
+            sstate = f"\033[1m{raw}\033[0m"
+            # ANSI escape codes inflate len() but don't occupy visible columns;
+            # pad so the table column stays at 8 visible chars regardless of bold.
+            sstate += " " * max(0, 8 - len(raw))
         if is_main:
             prefix = f"  {'':<14} {'':<40} {'':<9} {'':<7} {'':<6}"
         else:
@@ -3068,10 +3249,15 @@ def cmd_overview(args: argparse.Namespace, config: Config) -> None:
             args.wt = f"wt_{args.wt}"
         cmd_overview_wt(args, config)
         return
+    watch_mode = bool(getattr(args, "watch", False))
+    interval = float(getattr(args, "interval", 5.0))
+    if watch_mode and interval <= 0:
+        fail("--interval must be > 0")
+
+    # Reconciling --all and --recent: --all disables recent-* seconds filtering
     show_all = bool(getattr(args, "all", False))
     if show_all:
         recent_seconds: int | None = None
-        args.show_unwatch = True  # --all implies --show-unwatch
         args.show_unwatch = True  # --all implies --show-unwatch
     else:
         recent_arg = getattr(args, "recent", None)
@@ -3079,18 +3265,33 @@ def cmd_overview(args: argparse.Namespace, config: Config) -> None:
             recent_seconds = _OVERVIEW_RECENT_DEFAULT_SECONDS
         else:
             recent_seconds = _parse_duration(recent_arg)
-    payload = collect_overview(
-        config,
-        recent_seconds=recent_seconds,
-        show_all=show_all,
-        verbose=bool(getattr(args, "verbose", False)),
-    )
-    if args.format == "json":
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-        return
-    show_orphan = bool(getattr(args, "show_orphan", False))
-    show_unwatch = bool(getattr(args, "show_unwatch", False))
-    print_overview_text(payload, args.detail, config, show_orphan=show_orphan, show_unwatch=show_unwatch)
+
+    while True:
+        payload = collect_overview(
+            config,
+            recent_seconds=recent_seconds,
+            show_all=show_all,
+            verbose=bool(getattr(args, "verbose", False)),
+        )
+        if args.format == "json":
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            if not watch_mode:
+                return
+            time.sleep(interval)
+            continue
+        if watch_mode and sys.stdout.isatty():
+            sys.stdout.write("\033[2J\033[H")
+        show_orphan = bool(getattr(args, "show_orphan", False))
+        show_unwatch = bool(getattr(args, "show_unwatch", False))
+        print_overview_text(payload, args.detail, config, show_orphan=show_orphan, show_unwatch=show_unwatch)
+        if not watch_mode:
+            return
+        sys.stdout.flush()
+        try:
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            print()
+            return
 
 
 def cmd_overview_session(args: argparse.Namespace, config: Config) -> None:
@@ -3263,6 +3464,9 @@ def cmd_overview_wt(args: argparse.Namespace, config: Config) -> None:
             verbose=bool(getattr(args, "verbose", False)),
         )
         # Cap PM groups to current + the newest historical PM states.
+        # Tagged historical PM (pm_session_id != "") outranks orphan (pm_sid="")
+        # so a tagged PM with older ``updated_ms`` is not displaced by a newer
+        # orphan that ``_PM_STATE_HISTORY_LIMIT_DEFAULT`` could not tag.
         pm_items = [it for it in kept_indexed if _is_pm_agent(it.get("agent"))]
         pm_groups: dict[str, list[dict[str, Any]]] = {}
         for it in pm_items:
@@ -3274,6 +3478,7 @@ def cmd_overview_wt(args: argparse.Namespace, config: Config) -> None:
                 pm_groups.items(),
                 key=lambda kv: (
                     0 if any(i.get("pm_current") for i in kv[1]) else 1,
+                    0 if kv[0] else 1,  # tagged PM outranks orphan (pm_sid != "")
                     -max(int(i.get("updated_ms", 0)) for i in kv[1]),
                 ),
             )
@@ -3495,9 +3700,10 @@ _IDLE_WATCH_STOP_TIMEOUT_DEFAULT = 3.0
 # ``POST /session/{id}/summarize`` after the busy->idle notify and then sends
 # a follow-up notify tagged ``[idle-notify:compact-done|compact-skipped|
 # compact-failed]``. Hardcoded per the Phase-1 spec — no CLI flag, since the
-# intent is a safety net, not a per-task knob. 300K is well below the
-# 200K-token context window of deepseek-v4-flash-free with safety margin, and
-# matches the budget that other toolchain scripts use to flag "context is
+# intent is a safety net, not a per-task knob. The 300K threshold is above
+# the 200K-token context window of deepseek-v4-flash-free, so it acts as a
+# last-ditch compact before the next request would be guaranteed to fail;
+# the budget matches what other toolchain scripts use to flag "context is
 # getting expensive".
 _AUTO_COMPACT_THRESHOLD = 300_000
 _AUTO_COMPACT_HTTP_TIMEOUT = 60
@@ -3557,7 +3763,11 @@ def _spawn_dispatch_idle_watch(
     if agent:
         cmd.extend(["--agent", agent])
     if max_poll_seconds > 0:
-        cmd.extend(["--max-poll-seconds", str(int(max_poll_seconds))])
+        # ``--max-poll-seconds`` is ``type=float`` end-to-end (parent
+        # dispatch and child idle-watch both share ``_add_dispatch_options``
+        # / ``_add_watch_common``), so the float is passed through without
+        # rounding.
+        cmd.extend(["--max-poll-seconds", str(max_poll_seconds)])
     if started_at_ms > 0:
         cmd.extend(["--started-at-ms", str(int(started_at_ms))])
         cmd.append("--notify-if-idle-after-update")
@@ -3575,7 +3785,7 @@ def _spawn_dispatch_idle_watch(
     finally:
         log_fd.close()
 
-    pf.write_text(str(proc.pid), encoding="utf-8")
+    _write_pid_file(pf, proc.pid)
     eprint(f"[dispatch] auto idle-watch spawned: target={target_sid} notify={notify_sid} pid={proc.pid}")
 
 
@@ -3638,8 +3848,17 @@ def cmd_idle_watch(args: argparse.Namespace, config: Config) -> None:
     #           second PM notify (compact-done / compact-skipped), then exit.
     # compact_before carries the pre-summarize context from phase 0 into
     # phase 1 so the second notify can report the before→after delta.
+    # phase1_saw_busy gates the compact-done fire: without it, the sidecar
+    # could still report ``idle`` for one or more ticks after the ping was
+    # queued (event ingestion lag), and we would mis-classify the very first
+    # post-ping ``idle`` observation as a busy→idle transition and fire
+    # compact-done without ever seeing the ping go busy. Track an explicit
+    # "have we actually observed busy/streaming since the ping was sent"
+    # flag so compact-done only fires after a real busy→idle edge.
     phase = 0
     compact_before = 0
+    phase1_saw_busy = False
+    ping_sent_at_ms = 0  # epoch ms when the compact ping was dispatched; used to detect ping completion between polls
 
     while True:
         if deadline is not None and time.monotonic() > deadline:
@@ -3673,6 +3892,15 @@ def cmd_idle_watch(args: argparse.Namespace, config: Config) -> None:
 
         if current_status in ("busy", "streaming"):
             saw_busy_or_streaming = True
+            if phase == 1:
+                # Mark that we have actually observed the post-ping busy edge.
+                # Combined with the busy→idle handler above, this is the only
+                # path that can fire compact-done; without it, the very first
+                # post-ping tick can still see ``idle`` due to sidecar event
+                # ingestion lag, and we would mis-classify it as the
+                # transition edge and emit compact-done before any real work
+                # has been observed.
+                phase1_saw_busy = True
             if busy_since is None:
                 busy_since = time.monotonic()
             if not stuck_notified:
@@ -3727,14 +3955,49 @@ def cmd_idle_watch(args: argparse.Namespace, config: Config) -> None:
             notify_reason = "idle after dispatch update"
 
         if should_notify:
+            # Phase 1 post-ping suppression: a single ``busy -> idle``
+            # observation can fire on the first tick after the ping was
+            # queued, because sidecar event ingestion lags behind the
+            # ``/prompt_async`` 204 by a few hundred ms. We have not yet
+            # observed the ping go busy (phase1_saw_busy is False), so this
+            # is the sidecar catching up, not a real transition. Suppress
+            # BOTH the compact-done branch (the phase1_saw_busy guard) AND
+            # the normal notify path so we do not send a duplicate phase-0
+            # notify. Just wait for the next tick to either see busy/streaming
+            # (the ping has been picked up) or the real busy→idle edge.
+            if phase == 1 and not phase1_saw_busy and notify_reason == "busy -> idle":
+                # The poll saw idle after the ping was queued, but we never
+                # observed busy. Two possibilities: (a) sidecar event-ingestion
+                # lag — the ping hasn't been picked up yet; or (b) the ping
+                # completed (went busy→idle) entirely between this poll and the
+                # last. Distinguish by checking whether the session's
+                # time.updated has advanced past ping_sent_at_ms — if it has,
+                # the ping was processed and we can proceed to compact-done.
+                if ping_sent_at_ms > 0:
+                    ses_data = get_session_by_id(config, target)
+                    if ses_data:
+                        ses_updated = int((ses_data.get("time") or {}).get("updated", 0))
+                        if ses_updated > ping_sent_at_ms:
+                            eprint("[idle-watch] phase 1: ping completed between polls (updated_ms advanced); un-suppressing")
+                            phase1_saw_busy = True
+                            # fall through to compact-done below
+                if not phase1_saw_busy:
+                    eprint("[idle-watch] phase 1: sidecar still reports idle after ping; waiting for real busy→idle edge")
+                    previous_status = current_status
+                    time.sleep(interval)
+                    continue
             # Phase 1: ping prompt_async has been folded into the target's
             # history. Re-fetch context (now accurate — the post-summarize
             # state is in the live message log) and emit the second notify,
             # then exit. Race check: a single re-fetched status guards
             # against a "user dispatched a new task between the ping
             # completing and us reading the context" scenario, in which case
-            # the context delta would be misleading.
-            if notify_reason == "busy -> idle" and phase == 1:
+            # the context delta would be misleading. The ``phase1_saw_busy``
+            # guard ensures we only emit compact-done after observing an
+            # actual busy→idle edge — without it, sidecar event-ingestion
+            # lag could leave the first post-ping tick reading ``idle`` and
+            # we would mis-fire compact-done before the ping ever went busy.
+            if notify_reason == "busy -> idle" and phase == 1 and phase1_saw_busy:
                 eprint("[idle-watch] phase 1 busy→idle: ping completed; verifying post-compact context")
                 ctx_after = fetch_session_context(config, target)
                 post_status = _idle_fetch_status(config, target)
@@ -3822,7 +4085,7 @@ def cmd_idle_watch(args: argparse.Namespace, config: Config) -> None:
                                 ping_url,
                                 ping_body,
                                 expected=(204,),
-                                timeout=ping_effective_timeout,
+                                timeout=ping_effective_timeout,  # type: ignore
                             )
                         except SystemExit as exc:
                             eprint(f"[idle-watch] ping send failed: {exc}; sending compact-failed")
@@ -3838,13 +4101,21 @@ def cmd_idle_watch(args: argparse.Namespace, config: Config) -> None:
                             return
                         eprint("[idle-watch] phase 0→1: ping dispatched; waiting for next busy→idle edge to read accurate post-compact context")
                         phase = 1
+                        ping_sent_at_ms = int(time.time() * 1000)
                         # Force the next tick to detect busy→idle: the ping
                         # has just been queued, so the session is about to
                         # go busy; setting previous_status="busy" here means
                         # the next idle observation fires the edge branch.
                         # We `continue` (not `return`) so the existing poll
                         # loop re-fetches and observes the transition.
+                        # Short sleep before the continue to avoid a tight
+                        # loop hammering sidecar /status: if sidecar event
+                        # ingestion lags, the next tick can also report
+                        # ``idle`` and we re-enter the phase 1 suppression
+                        # branch above — without this sleep, that path
+                        # would burn one HTTP call per loop turn.
                         previous_status = "busy"
+                        time.sleep(0.3)
                         continue
                     return
 
@@ -3918,7 +4189,7 @@ def cmd_idle_watch_start(args: argparse.Namespace, config: Config) -> None:
     finally:
         log_fd.close()
 
-    pf.write_text(str(proc.pid), encoding="utf-8")
+    _write_pid_file(pf, proc.pid)
 
     eprint(f"[idle-watch] started target={target} notify={notify} pid={proc.pid} log={lf}")
 
@@ -3939,18 +4210,17 @@ def cmd_idle_watch_stop(args: argparse.Namespace, config: Config) -> None:
         return
 
     eprint(f"[idle-watch] {target}: sending SIGTERM to pid {pid}")
-    term_sent = False
-    try:
-        os.killpg(pid, signal.SIGTERM)
-        term_sent = True
-    except (ProcessLookupError, PermissionError):
-        pass
+    # Signal only the recorded PID, not the process group. ``start_new_session=True``
+    # in the spawner already isolates the child into its own session/group, so
+    # killpg(pid, ...) was an unneeded group-wide broadcast — and a footgun:
+    # if the recorded PID were ever recycled by the OS before we reached this
+    # line, killpg would have signalled whatever unrelated group now owns it.
     try:
         os.kill(pid, signal.SIGTERM)
-        term_sent = True
-    except (ProcessLookupError, PermissionError):
-        if not term_sent:
-            raise
+    except ProcessLookupError:
+        eprint(f"[idle-watch] {target}: pid {pid} already exited before SIGTERM")
+    except PermissionError as exc:
+        fail(f"cannot SIGTERM pid {pid} (permission denied): {exc}")
 
     stop_timeout = args.stop_timeout
     deadline = time.monotonic() + stop_timeout
@@ -3963,18 +4233,12 @@ def cmd_idle_watch_stop(args: argparse.Namespace, config: Config) -> None:
 
     if args.force:
         eprint(f"[idle-watch] {target}: SIGTERM timeout; sending SIGKILL to pid {pid}")
-        kill_sent = False
-        try:
-            os.killpg(pid, signal.SIGKILL)
-            kill_sent = True
-        except (ProcessLookupError, PermissionError):
-            pass
         try:
             os.kill(pid, signal.SIGKILL)
-            kill_sent = True
-        except (ProcessLookupError, PermissionError):
-            if not kill_sent:
-                raise
+        except ProcessLookupError:
+            eprint(f"[idle-watch] {target}: pid {pid} already exited before SIGKILL")
+        except PermissionError as exc:
+            fail(f"cannot SIGKILL pid {pid} (permission denied): {exc}")
         time.sleep(0.1)
         if pid_alive(pid):
             fail(f"failed to kill pid {pid} even with SIGKILL")
@@ -4230,20 +4494,8 @@ def cmd_service(args: argparse.Namespace, config: Config) -> None:
     _one(component, action)
 
 
-def cmd_pool_prepare(args: argparse.Namespace, config: Config) -> None:
-    cmd_prepare(args, config)
-
-
-def cmd_pool_release(args: argparse.Namespace, config: Config) -> None:
-    cmd_release(args, config)
-
-
-def cmd_pool_dispatch(args: argparse.Namespace, config: Config) -> None:
-    cmd_dispatch(args, config)
-
-
-def _render_continue_prompt(wt_id: str, agent: str, branch: str, wt_path: Path, old_sid: str) -> str:
-    """Generate a continuation prompt for ``pool continue``."""
+def _render_repair_stuck_prompt(wt_id: str, agent: str, branch: str, wt_path: Path, old_sid: str) -> str:
+    """Generate a continuation prompt for ``pool repair_stuck``."""
     lines: list[str] = []
     try:
         log_out = git(wt_path, "log", "--oneline", "-10", capture=True).stdout.strip()
@@ -4260,8 +4512,8 @@ def _render_continue_prompt(wt_id: str, agent: str, branch: str, wt_path: Path, 
     return "\n".join(lines)
 
 
-def cmd_pool_continue(args: argparse.Namespace, config: Config) -> None:
-    """Continue work on a stuck session — same branch, new session, auto-prompt."""
+def cmd_pool_repair_stuck(args: argparse.Namespace, config: Config) -> None:
+    """Repair a stuck session — same branch, new session, auto-prompt."""
     check_services(config)
     wt_id = args.wt_id
     validate_wt_id(wt_id)
@@ -4272,15 +4524,17 @@ def cmd_pool_continue(args: argparse.Namespace, config: Config) -> None:
     if not branch:
         fail(f"{wt_id} has no active branch; use pool prepare first")
     old_sid = state.get(f"{agent}_session_id", "")
+    old_session_status = ""
     if old_sid:
         status_map = http_json("GET", f"{config.sidecar}/status")
         session_status = "unknown"
         if isinstance(status_map, dict):
             session_status = str(status_map.get(old_sid, "unknown"))
+        old_session_status = session_status
         if session_status not in ("busy", "streaming"):
             eprint(f"note: old session {old_sid} is {session_status} (not stuck); continuing anyway")
     # Build continuation prompt (preview-safe: no side effects before --yes)
-    prompt_text = _render_continue_prompt(wt_id, agent, branch, wt_path, old_sid)
+    prompt_text = _render_repair_stuck_prompt(wt_id, agent, branch, wt_path, old_sid)
     if args.task:
         prompt_text = args.task.strip() + "\n\n---\n\n" + prompt_text
     # Build dispatch body
@@ -4307,12 +4561,22 @@ def cmd_pool_continue(args: argparse.Namespace, config: Config) -> None:
         print(json.dumps(preview, ensure_ascii=False, indent=2))
         print()
         notify_flag = f" --notify-session {args.notify_session}" if args.notify_session else ""
-        print(f"python3 scripts/session-worktree-mgr.py pool continue {args.wt_id} {agent} --yes{notify_flag}")
+        print(f"python3 scripts/session-worktree-mgr.py pool repair_stuck {args.wt_id} {agent} --yes{notify_flag}")
         return
-    # --yes: delete old stuck session, create fresh one, dispatch
+    # --yes: archive/unwatch old stuck session (or hard-delete only when --force),
+    # create fresh one, dispatch. When old session is still busy/streaming,
+    # archive is unsafe (two sessions would operate on the same worktree
+    # concurrently); require --force to hard-delete and terminate the old
+    # session first.
     if old_sid:
-        delete_session(config, old_sid, hard=True)
-        eprint(f"hard-deleted stuck session: {old_sid}")
+        hard_delete = bool(getattr(args, "force", False))
+        if old_session_status in ("busy", "streaming") and not hard_delete:
+            fail(f"old session {old_sid} is still {old_session_status}; pass --force to hard-delete it before continuing, or stop the session first")
+        delete_session(config, old_sid, hard=hard_delete)
+        if hard_delete:
+            eprint(f"hard-deleted stuck session: {old_sid}")
+        else:
+            eprint(f"archived/unwatched stuck session: {old_sid} (use --force to hard-delete)")
     update_state(config, wt_id, {f"{agent}_session_id": ""})
     new_ses = ensure_session(config, wt_id, wt_path, agent, recreate_existing=True)
     sid = new_ses["id"]
@@ -4451,10 +4715,20 @@ def cmd_legacy_overview(args: argparse.Namespace, config: Config) -> None:
 # ---------------- parser ----------------
 
 
-def _add_dispatch_options(parser: argparse.ArgumentParser, *, allow_session: bool) -> None:
+def _add_dispatch_options(
+    parser: argparse.ArgumentParser,
+    *,
+    allow_session: bool,
+    task_required: bool = True,
+) -> None:
     if allow_session:
         parser.add_argument("--session", default=None, help=argparse.SUPPRESS)
-    parser.add_argument("--task", required=True, help="Task text to send. Without --yes this only previews the prompt.")
+    if task_required:
+        parser.add_argument("--task", required=True, help="Task text to send. Without --yes this only previews the prompt.")
+    else:
+        # ``pool repair_stuck`` auto-generates the continuation prompt when --task
+        # is omitted; --task is an optional override on top of it.
+        parser.add_argument("--task", default="", help="Optional task override. If omitted, the continuation prompt is auto-generated.")
     parser.add_argument("--yes", action="store_true", help="Actually send the prompt. Without this flag, print a preview only.")
     parser.add_argument("--force", action="store_true", help="Hard-delete stuck session and create a fresh one before dispatching.")
     parser.add_argument(
@@ -4465,11 +4739,11 @@ def _add_dispatch_options(parser: argparse.ArgumentParser, *, allow_session: boo
     parser.add_argument(
         "--require-no-busy",
         action="store_true",
-        help="Refuse dispatch unless session is idle/unwatch. busy/streaming always fail.",
+        help="Refuse dispatch unless session is idle/unknown/unwatch. busy/streaming always fail.",
     )
     parser.add_argument(
         "--max-poll-seconds",
-        type=int,
+        type=float,
         default=0,
         help="Max poll seconds for auto idle-watch. 0 = unlimited. Recommended: 1800 for long backend tasks.",
     )
@@ -4626,24 +4900,24 @@ Use cases:
     pool_prepare.add_argument("--branch", "-b", required=True)
     pool_prepare.add_argument("--agents")
     pool_prepare.add_argument("--force-branch", action="store_true")
-    pool_prepare.set_defaults(func=cmd_pool_prepare)
+    pool_prepare.set_defaults(func=cmd_prepare)
 
     pool_dispatch = pool_sub.add_parser("dispatch", help="Dispatch a task to a pool worktree agent session.")
     pool_dispatch.add_argument("wt_id", help="Pool worktree id, e.g. wt_1")
     pool_dispatch.add_argument("agent", help="Agent name, e.g. Daedalus")
     _add_dispatch_options(pool_dispatch, allow_session=False)
-    pool_dispatch.set_defaults(func=cmd_pool_dispatch, session=None)
+    pool_dispatch.set_defaults(func=cmd_dispatch, session=None)
 
-    pool_continue = pool_sub.add_parser("continue", help="Continue work on a stuck session — create new session on same branch, auto-generate continuation prompt.")
+    pool_continue = pool_sub.add_parser("repair_stuck", help="Repair a stuck session — archive old, create new session on same branch, auto-generate continuation prompt.")
     pool_continue.add_argument("wt_id", help="Pool worktree id, e.g. wt_1")
     pool_continue.add_argument("agent", help="Agent name, e.g. Daedalus")
-    _add_dispatch_options(pool_continue, allow_session=False)
-    pool_continue.set_defaults(func=cmd_pool_continue, session=None)
+    _add_dispatch_options(pool_continue, allow_session=False, task_required=False)
+    pool_continue.set_defaults(func=cmd_pool_repair_stuck, session=None)
 
     pool_release = pool_sub.add_parser("release", help="Reset a task worktree and mark it idle.")
     pool_release.add_argument("target", help="wt_N or worktree path")
     pool_release.add_argument("--force", action="store_true", help="Discard uncommitted changes with git reset --hard && git clean -fd.")
-    pool_release.set_defaults(func=cmd_pool_release)
+    pool_release.set_defaults(func=cmd_release)
 
     # Single-session resource
     session = sub.add_parser(
@@ -4763,6 +5037,8 @@ Deprecated compatibility:
     )
     _add_overview_filters(overview)
     overview.add_argument("--session", help=argparse.SUPPRESS)
+    overview.add_argument("--watch", action="store_true", help="Continuously refresh overview (Ctrl+C to stop).")
+    overview.add_argument("--interval", type=float, default=5.0, help="Refresh interval in seconds (default: 5.0, requires --watch).")
     overview.set_defaults(func=cmd_legacy_overview)
 
     # Watch resource (new names), backed by existing idle-watch implementation.
@@ -4839,26 +5115,6 @@ Examples:
 
     # Legacy idle-watch top-level aliases.
     _add_idle_watch_subparsers(sub)
-
-    # Hide deprecated compatibility aliases from top-level help while keeping
-    # them callable. argparse.SUPPRESS alone still leaks as "==SUPPRESS=="
-    # in some Python versions for subparser pseudo-actions, so prune the
-    # display list explicitly and use a fixed metavar above for usage.
-    legacy_names = {
-        "opencode-serve-service",
-        "sidecar-service",
-        "prepare",
-        "dispatch",
-        "release",
-        "status",
-        "last",
-        "idle-watch",
-        "idle-watch-start",
-        "idle-watch-stop",
-        "idle-watch-status",
-        "idle-watch-restart",
-    }
-    sub._choices_actions = [a for a in sub._choices_actions if getattr(a, "dest", "") not in legacy_names and getattr(a, "help", None) is not argparse.SUPPRESS]
     return parser
 
 

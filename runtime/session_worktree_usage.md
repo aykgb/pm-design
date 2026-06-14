@@ -53,9 +53,11 @@ wt_5  <branch>  <commit>  clean  <Δ>  (无)  ...  (9 unwatch sessions hidden; p
 python3 scripts/session-worktree-mgr.py session show ses_xxx
 python3 scripts/session-worktree-mgr.py session status ses_xxx
 python3 scripts/session-worktree-mgr.py session last ses_xxx
-python3 scripts/session-worktree-mgr.py session dispatch ses_xxx --task "..." --yes
+python3 scripts/session-worktree-mgr.py session dispatch ses_xxx --task '...' --yes
 ```
 
+> **`--task` 引号**：有括号 `()`、`$`、反引号等特殊字符时，务必用**单引号** `'...'`（zsh 原样传递，不做任何解析）。双引号 `"..."` 会触发命令替换，如 `recent_pm_state_files()` 被解析为函数调用而报 `parse error`。多行 prompt 单引号也直接支持，无需临时文件。
+>
 > **`session show` Context 字段**：反映 session 最近一次已完成的 LLM 调用的上下文窗口大小。若 session 正在跑 tool call，可能显示 0——此时可等 busy→idle 后再查。
 
 ### 多个 sessions
@@ -74,8 +76,8 @@ python3 scripts/session-worktree-mgr.py pool status --verify
 python3 scripts/session-worktree-mgr.py pool init --size 10
 python3 scripts/session-worktree-mgr.py pool repair wt_1
 python3 scripts/session-worktree-mgr.py pool prepare --branch feat_xxx [--agents AGENTS] [--force-branch]
-python3 scripts/session-worktree-mgr.py pool dispatch wt_1 Daedalus --task "..." [--yes] [--force]
-python3 scripts/session-worktree-mgr.py pool continue wt_1 Daedalus [--yes]
+python3 scripts/session-worktree-mgr.py pool dispatch wt_1 Daedalus --task '...' [--yes] [--force]
+python3 scripts/session-worktree-mgr.py pool repair_stuck wt_1 Daedalus [--yes]
 python3 scripts/session-worktree-mgr.py pool release wt_1
 ```
 
@@ -117,33 +119,33 @@ python3 scripts/session-worktree-mgr.py pool prepare --branch feat_xxx
 **3. 正常任务直接派发：**
 
 ```bash
-python3 scripts/session-worktree-mgr.py pool dispatch wt_1 Daedalus --task "..." --yes
+python3 scripts/session-worktree-mgr.py pool dispatch wt_1 Daedalus --task '...' --yes
 ```
 
 `dispatch --yes` 会自动启动 idle-watch；agent 从 busy 回到 idle 后会自动通知 PM session。
 
-**3a. Stuck session 续接（pool continue）：**
+**3a. Stuck session 续接（pool repair_stuck）：**
 
 ```bash
 # 保留已有分支 + commits → 新 session → 自动续接 prompt（含 git log 快照）
-python3 scripts/session-worktree-mgr.py pool continue wt_1 Daedalus --yes
+python3 scripts/session-worktree-mgr.py pool repair_stuck wt_1 Daedalus --yes
 ```
 
-适用：session stuck 但 agent 已部分完成并推了 commits。与 `--force` 重写不同，`continue` 保留分支和已有工作，仅创建全新 session 续接。
+适用：session stuck 但 agent 已部分完成并推了 commits。与 `--force` 重写不同，`repair_stuck` 保留分支和已有工作，仅创建全新 session 续接。
 
 ```bash
 # 预览续接 prompt（不实际派发）
-python3 scripts/session-worktree-mgr.py pool continue wt_1 Daedalus --task "补充说明..." 
+python3 scripts/session-worktree-mgr.py pool repair_stuck wt_1 Daedalus --task '补充说明...' 
 ```
 
 **3b. Stuck session 强制恢复（--force）：**
 
 ```bash
-# 自动恢复（session busy > 15min 且 time.updated 无刷新 → 自动 hard-delete + 重建）
-python3 scripts/session-worktree-mgr.py pool dispatch wt_1 Daedalus --task "..." --yes
+# 自动恢复（session busy > 10min 且 time.updated 无刷新 → 自动 hard-delete + 重建）
+python3 scripts/session-worktree-mgr.py pool dispatch wt_1 Daedalus --task '...' --yes
 
 # 强制恢复（不限 staleness，直接 hard-delete + 重建，丢弃已有工作）
-python3 scripts/session-worktree-mgr.py pool dispatch wt_1 Daedalus --task "..." --force --yes
+python3 scripts/session-worktree-mgr.py pool dispatch wt_1 Daedalus --task '...' --force --yes
 ```
 
 区别：
@@ -151,8 +153,8 @@ python3 scripts/session-worktree-mgr.py pool dispatch wt_1 Daedalus --task "..."
 | 路径 | 场景 | 行为 | 分支 |
 |------|------|------|------|
 | 正常 dispatch | session idle | 复用旧 session | 不改变 |
-| `continue` | stuck 但有 commits | 新 session + 续接 prompt | **保留**已有 branch |
-| stale 自动恢复 | stuck > 15min | hard-delete + 重建 | 保留（同 wt，不 checkout 新 branch） |
+| `repair_stuck` | stuck 但有 commits | 新 session + 续接 prompt | **保留**已有 branch |
+| stale 自动恢复 | stuck > 10min | hard-delete + 重建 | 保留（同 wt，不 checkout 新 branch） |
 | `--force` | 彻底卡死、无产出 | hard-delete + 重建 | 保留（同 wt） |
 
 **4. 释放 worktree：**
@@ -181,7 +183,7 @@ dispatch 后 idle-watch 检测到 busy→idle 时，若 session context 超过 3
 只有高风险任务才先预览，不加 `--yes`：
 
 ```bash
-python3 scripts/session-worktree-mgr.py pool dispatch wt_1 Daedalus --task "..."
+python3 scripts/session-worktree-mgr.py pool dispatch wt_1 Daedalus --task '...'
 ```
 
 高风险任务包括：
@@ -255,18 +257,18 @@ python3 scripts/session-worktree-mgr.py pool prepare --branch feat_xxx --wt wt_1
 | no idle initialized worktree | 可执行 `pool status --verify` 查看状态；需要初始化/修复时先向用户报告，再建议 `pool init` 或 `pool repair wt_N` |
 | missing/stale session id | dispatch `--yes` 时自动 `ensure_session + persist_session`；preview 显示 `auto_create: true` + reason。仅在 OpenCode 端硬错误（服务不可达 / 配额满）时报错，需先修复 OpenCode 再重试 |
 | worktree is dirty | 不主动丢弃修改；先报告 dirty 状态，用户确认后才可执行 `pool release wt_N --force` |
-| stuck-notify（idle-watch 通知） | 消息含 target / wt / agent / stale 时长。有 commits → `pool continue`；无产出 → `--force` |
-| session busy/streaming < 15min | 正常工作中，等待；确认为卡死时用 `continue` 或 `--force` |
+| stuck-notify（idle-watch 通知） | 消息含 target / wt / agent / stale 时长。有 commits → `pool repair_stuck`；无产出 → `--force` |
+| session busy/streaming < 10min | 正常工作中，等待；确认为卡死时用 `repair_stuck` 或 `--force` |
 | 未收到 idle-watch 通知 | 可 fallback 执行 `session status ses_xxx`，必要时 `session last ses_xxx` |
 
 ## 操作边界
 
 - PM 可以主动执行只读检查命令，例如 `overview`、`pool status --verify`、`session status`、`session last`。
-- PM 可以按任务流程执行 `pool prepare`、`pool dispatch ... --yes`、`pool continue`。
-- Stuck session（busy > 15min 且 time.updated 无刷新）→ idle-watch 发送 stuck-notify（含 wt/agent 上下文）。PM 收到后判断：有 commits → `pool continue`；无产出 → `dispatch --force`。
-- `pool continue` 保留已有 branch 和 commits，创建全新 session + 自动续接 prompt（含 `git log --oneline -10`）；无 `--yes` 时仅预览，不修改状态。
+- PM 可以按任务流程执行 `pool prepare`、`pool dispatch ... --yes`、`pool repair_stuck`。
+- Stuck session（busy > 10min 且 time.updated 无刷新）→ idle-watch 发送 stuck-notify（含 wt/agent 上下文）。PM 收到后判断：有 commits → `pool repair_stuck`；无产出 → `dispatch --force`。
+- `pool repair_stuck` 保留已有 branch 和 commits，创建全新 session + 自动续接 prompt（含 `git log --oneline -10`）；无 `--yes` 时仅预览，不修改状态。
 - PM 不主动启动、停止、重启服务。
-- PM 不主动执行破坏性命令，例如 `pool release --force`、`session delete --hard`、批量 delete。`dispatch --force` / `pool continue` 的自动 hard-delete 除外。
+- PM 不主动执行破坏性命令，例如 `pool release --force`、`session delete --hard`、批量 delete。`dispatch --force` / `pool repair_stuck` 的自动 hard-delete 除外。
 - 遇到服务异常、dirty worktree、缺失 session、需要 repair/init 的情况，先向用户报告原因和建议命令。
 - 只有用户明确确认后，才执行修复类或破坏性命令。
 
@@ -277,7 +279,7 @@ python3 scripts/session-worktree-mgr.py pool prepare --branch feat_xxx --wt wt_1
 - worktree 生命周期一律用 `pool`。
 - 正常任务默认直接派发 `--yes`。
 - 高风险任务才先预览派发。
-- stuck session 有 commits → `pool continue`；无产出 → `dispatch --force`。
+- stuck session 有 commits → `pool repair_stuck`；无产出 → `dispatch --force`。
 - dispatch 会自动 idle-watch；主动查看结果只作为 fallback。
 - stuck-notify 消息含 wt / agent / stale 时长，无需手动查 overview。
 - overview 全局一次 `/session?limit=2000` HTTP 调用，非 per-wt 多次调用。
