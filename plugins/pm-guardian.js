@@ -11,7 +11,6 @@ const WARN = "warn";
 const ERROR = "error";
 
 const SESSION_MARKER = "opencode-current-session";
-const SESSION_GUARD_MARKER = "opencode-pm-session-guard";
 const INSTRUCT_MARKER = "opencode-pm-instruct";
 
 const DEFAULT_CONFIG_FILE = "pm-guardian.conf.json";
@@ -339,6 +338,15 @@ export const PMGuardianPlugin = async (context) => {
                     ...conflict,
                 });
 
+                // 持久化 conflict：写回 pm-session-info.json，让 status.py / overview 可检测
+                const conflictRecord = {
+                    ...current,
+                    blocked_session_id: sessionID,
+                    blocked_at: nowIso,
+                    updated_at: nowIso,
+                };
+                await writeJsonAtomic(sessionInfoPath, stripUndefined(conflictRecord));
+
                 return conflict;
             }
 
@@ -491,7 +499,6 @@ export const PMGuardianPlugin = async (context) => {
                 });
 
                 if (!guard.allowed) {
-                    output.system.push(wrapSessionGuardConflict(guard, frozenPromptConfig));
                     return output;
                 }
 
@@ -833,26 +840,9 @@ function wrapInstruct(section) {
 function wrapSessionInfo(record, promptConfig) {
     return [
         `<${SESSION_MARKER}>`,
-        `pm_current_session_id: ${record.current_session_id}`,
+        `PM_CURRENT_SESSION_ID: ${record.current_session_id}`,
         `session_info_file: .pm/${promptConfig.sessionInfoFile}`,
         `</${SESSION_MARKER}>`,
-    ].join("\n");
-}
-
-/**
- * Guard payload injected into a conflicting PM session.
- */
-function wrapSessionGuardConflict(guard, promptConfig) {
-    return [
-        `<${SESSION_GUARD_MARKER}>`,
-        `status: blocked`,
-        `reason: another PM session is already active for this main worktree`,
-        `current_session_id: ${guard.currentSessionID}`,
-        `requested_session_id: ${guard.requestedSessionID}`,
-        `current_owner_process_pid: ${guard.liveness?.pid || ""}`,
-        `current_owner_process_alive: ${guard.liveness?.alive ?? "unknown"}`,
-        `instruction: Do not act as PM in this session. Ask the user to continue in the current_session_id session, delete .pm/${promptConfig.sessionInfoFile}, or restart with sessionGuardForceTakeover=true in .pm/${DEFAULT_CONFIG_FILE} if takeover is intentional.`,
-        `</${SESSION_GUARD_MARKER}>`,
     ].join("\n");
 }
 

@@ -1552,7 +1552,7 @@ def cmd_prepare(args: argparse.Namespace, config: Config) -> None:
     print("用户确认后再发送")
     print(f'{PROG} pool dispatch {wt_id} {agents[0]} --task "..." --yes')
     print()
-    print("（可选：加 --notify-session <PM_ACTIVE_SESSION_ID> 自动 idle-watch，或设 $PM_ACTIVE_SESSION_ID）")
+    print("（可选：加 --notify-session <PM_CURRENT_SESSION_ID> 自动 idle-watch，或设 $PM_CURRENT_SESSION_ID）")
     print()
     print(f"已分配: {wt_id}")
 
@@ -4459,8 +4459,8 @@ def _add_dispatch_options(parser: argparse.ArgumentParser, *, allow_session: boo
     parser.add_argument("--force", action="store_true", help="Hard-delete stuck session and create a fresh one before dispatching.")
     parser.add_argument(
         "--notify-session",
-        default=env("PM_ACTIVE_SESSION_ID", ""),
-        help="PM session to notify when target becomes idle. Defaults to $PM_ACTIVE_SESSION_ID, then current PM session if available.",
+        default=env("PM_CURRENT_SESSION_ID", ""),
+        help="PM session to notify when target becomes idle. Defaults to $PM_CURRENT_SESSION_ID, then current PM session if available.",
     )
     parser.add_argument(
         "--require-no-busy",

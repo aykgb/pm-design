@@ -217,8 +217,29 @@ def check_pm_agent_alignment() -> CheckResult:
     )
 
 
+# SID 展示截断长度：避免长 SID 撑爆单行可读宽度；>20 字符时附加 "..."
+SID_DISPLAY_LEN = 20
+
+
+def _truncate_sid(sid: str) -> str:
+    """统一截断 SID 用于报告展示；空值返回 "(empty)"。"""
+    if not sid:
+        return "(empty)"
+    if len(sid) > SID_DISPLAY_LEN:
+        return f"{sid[:SID_DISPLAY_LEN]}..."
+    return sid
+
+
 def check_pm_session_active() -> CheckResult:
-    """验证 pm-session-info.json 指向本 PM 会话（未被 guard block 到旧会话）"""
+    """验证 pm-session-info.json 指向本 PM 会话（未被 guard block 到旧会话）
+
+    状态语义：
+    - pass : active session == this session（健康）
+    - warn : blocked session ≠ this session（其他 session 被 block，不阻断）
+             或 未传 --pm-session-id 无法比对
+    - fail : active session ≠ this session（guard block，需要 takeover）
+             或 this session 本身就是 blocked（无法履职）
+    """
     info_path = REPO_ROOT / ".pm" / "pm-session-info.json"
     if not info_path.exists():
         return CheckResult(
@@ -236,26 +257,41 @@ def check_pm_session_active() -> CheckResult:
             expected="valid JSON",
             actual="(unreadable)",
         )
-    file_sid = str(data.get("current_session_id") or "")
+    active_sid = str(data.get("current_session_id") or "")
+    blocked_sid = str(data.get("blocked_session_id") or "")
+    if blocked_sid:
+        if _pm_session_id and _pm_session_id == blocked_sid:
+            return CheckResult(
+                name="pm_session_active",
+                status="fail",
+                expected="no blocked PM session",
+                actual=(f"this PM session is blocked (active={_truncate_sid(active_sid)} holds the guard, this_id={_truncate_sid(_pm_session_id)} matches blocked — takeover needed)"),
+            )
+        return CheckResult(
+            name="pm_session_active",
+            status="warn",
+            expected="no blocked PM session",
+            actual=(f"blocked_session_id={_truncate_sid(blocked_sid)} (active={_truncate_sid(active_sid)} holds the guard; another session was blocked)"),
+        )
     if not _pm_session_id:
         return CheckResult(
             name="pm_session_active",
             status="warn",
             expected="--pm-session-id 传入本会话 ID 后可自动比对",
-            actual=f"session={file_sid[:20]}... (未传入，跳过比对)",
+            actual=(f"active current_session_id = {_truncate_sid(active_sid)} (未传 --pm-session-id，跳过 active ↔ this 比对)"),
         )
-    if file_sid == _pm_session_id:
+    if active_sid == _pm_session_id:
         return CheckResult(
             name="pm_session_active",
             status="pass",
-            expected=f"current_session_id = {_pm_session_id[:20]}...",
+            expected=f"active current_session_id = {_truncate_sid(_pm_session_id)}",
             actual="match",
         )
     return CheckResult(
         name="pm_session_active",
         status="fail",
-        expected=f"current_session_id = {_pm_session_id[:20]}...",
-        actual=f"current_session_id = {file_sid[:20]}... (guard blocked — takeover needed)",
+        expected=f"active current_session_id = {_truncate_sid(_pm_session_id)}",
+        actual=(f"active current_session_id = {_truncate_sid(active_sid)} (mismatch with this session — guard blocked, takeover needed)"),
     )
 
 

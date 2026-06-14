@@ -10,7 +10,7 @@
   "runtimeLogConfigPollIntervalMs": 10000,
   "instructFiles": [
     "persona.md",
-    "session_worktree_mgmt.md",
+    "session_worktree_usage.md",
     "operational_conventions.md"
   ]
 }

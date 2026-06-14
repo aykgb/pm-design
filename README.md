@@ -50,7 +50,7 @@ python .pm/design/scripts/pm-bootstrap.py
   "targetAgent": "pm",
   "instructFiles": [
     "persona.md",
-    "session_worktree_mgmt.md",
+    "session_worktree_usage.md",
     "operational_conventions.md"
   ]
 }
