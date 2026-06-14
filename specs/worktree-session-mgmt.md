@@ -40,8 +40,8 @@
 ```
 
 **三层结构**：
-- **Main worktree**：PM session + 4 个 main agent，跨任务复用，`session dispatch` 派发
-- **Pool worktrees**：每个 wt_N 有 4 个 agent（Daedalus / Themis / QA / Morpheus），round-robin 抢占，每任务重建 session
+- **Main worktree**：PM session + 4 个 main agent（Clio / General / Momus / Janitor），跨任务复用，`session dispatch` 派发
+- **Pool worktrees**：每个 wt_N 有 4 个 agent（Daedalus / Themis / QA / Morpheus），round-robin 抢占；session 由 dispatch 按需创建 + 复用（task_marker 决策树，详见 §3.4）
 - **Sidecar**：独立进程追踪 session 状态，供 overview State 列查询
 
 ## 2. State 文件系统
@@ -70,13 +70,17 @@
 | `base_ref` | release | 基线 commit（通常 `origin/main`） |
 | `initialized` | pool init | `"1"` 表示 worktree 已就绪 |
 | `updated_at` | 每次 update_state | ISO 时间戳 |
-| `Daedalus_session_id` | ensure_pool_sessions | 当前 session ID |
-| `Themis_session_id` | ensure_pool_sessions | 当前 session ID |
-| `QA_session_id` | ensure_pool_sessions | 当前 session ID |
-| `Morpheus_session_id` | ensure_pool_sessions | 当前 session ID |
-| `*_session_title` | ensure_pool_sessions | session 标题（如 `wt_1-Daedalus`） |
+| `task_marker` | prepare（每次新生成 `uuid.uuid4().hex`） | wt 当前任务标识；dispatch 比较该值与 `{agent}_task_marker` 判断任务边界 |
+| `Daedalus_session_id` | dispatch auto-create | 当前 session ID（不再由 prepare 预创建，commit `4eedee3`） |
+| `Themis_session_id` | dispatch auto-create | 同上 |
+| `QA_session_id` | dispatch auto-create | 同上 |
+| `Morpheus_session_id` | dispatch auto-create | 同上 |
+| `*_session_title` | dispatch auto-create | session 标题（如 `wt_1-Daedalus`） |
+| `{agent}_task_marker` | dispatch auto-create 时同步当前 `task_marker` | 该 agent 上次创建 session 时的任务标识；用于下次 dispatch 决策树判定 |
 
 格式为 `key=value`，每行一条。空行和 `#` 开头行为注释。
+
+**兼容性**：state 文件 schema 演进靠 `.get(key, "")` 兼容，旧 state 文件没有 `task_marker` / `{agent}_task_marker` 字段时，dispatch 决策树仍正确（marker 为空串，`"" == ""` 不触发 new-task；走 missing 或 stale 路径）。
 
 ### 2.3 `main.state` 字段
 
@@ -95,45 +99,65 @@
 ### 3.1 总览
 
 ```text
-pool init ──→ [idle] ──→ prepare ──→ [busy] ──→ dispatch ──→ Themis/QA ──→ merge
-                 ▲                                                              │
-                 └────────────────── release ──────────────────────────────────┘
+pool init ──→ [idle,无 sid] ──→ prepare ──→ [busy,task_marker] ──→ dispatch ──→ Themis/QA ──→ merge
+                  ▲                                                            │
+                  └──────────────────── release ─────────────────────────────┘
 ```
 
 ### 3.2 pool init：初始化 worktree
 
 1. 循环 `i = 1..pool_size`：
    - `git worktree add --force wt_i <base_ref>`（或 `--force-copy` 从已有 worktree 复制）
-   - `ensure_pool_sessions` → 为每个 agent 创建 OpenCode session → `persist_session` 写入 `wt_i.state`
    - 标记 `initialized=1`，`status=idle`
+   - **不创建 session**（commit `4eedee3`）—— 历史版本会预创建 4 个 agent session，但会造成"未 dispatch 的 unknown session"污染 overview / sidecar /status
 2. 全程持 `pool_lock`（mkdir 互斥锁）
 
-### 3.3 prepare：抢占 worktree
+**session 创建时机**：dispatch 首次调用某个 agent 时按需 auto-create（详见 §3.4）。
+
+### 3.3 prepare：抢占 worktree + task_marker
 
 1. **持 `pool_lock`**
 2. **`find_idle_wt`**：从 `.pool_rr_index` 记录的起始位置开始，round-robin 扫描 status=`idle` + initialized 的 worktree，命中后更新指针到下一个
 3. **checkout 任务分支**：`git checkout -b feat_PN_TM`（基于 `base_ref`）
-4. **`ensure_pool_sessions`**：`recreate_always=True`，删除旧 session 并创建全新 session → 保证跨任务隔离，每次 prepare 都是冷启动
-5. **`update_state`**：`status=busy`，`branch=<任务分支>`
+4. **生成 `task_marker`**：`uuid.uuid4().hex` 写入 state（commit `16abebf`）
+5. **`update_state`**：`status=busy`，`branch=<任务分支>`，`task_marker=<新 uuid>`
 6. 打印 dispatch 命令提示
+
+**关键变更（commit `653b827` + `16abebf`）**：`prepare` 不再调 `ensure_pool_sessions`，**session 创建职责完全下沉到 dispatch**（auto-create on first use）；`pool repair` 也不再预创建 sessions。
+
+**task_marker 设计意图**：dispatch 比较 `state.{agent}_task_marker` 与 `state.task_marker`，不等则触发"new-task"重建。uuid 保证同 branch 重 prepare（release → prepare 同分支）也触发 new-task，因为 uuid 每次新生成。
 
 **并发安全**：`pool_lock` 确保同一时刻只有一个 prepare/release/repair 操作。
 
-### 3.4 dispatch：派发 agent
+### 3.4 dispatch：派发 agent + task_marker 决策树
 
-1. 查 sidecar `/status` 获取目标 session 当前状态
-2. `--require-no-busy` 模式下，`busy`/`streaming` 状态拒绝派发
-3. `POST /session/{sid}/prompt_async` 异步发送 prompt
-4. 可选 `--notify-session`：spawn `idle-watch` 后台进程，监听 session busy→idle 后通知 PM
+1. 查 state `{agent}_session_id`，取 `sid`
+2. 查 sidecar `/status` 获取目标 session 当前状态（`idle` / `busy` / `unknown`）
+3. `--require-no-busy` 模式下，`busy`/`streaming` 状态拒绝派发
+4. **决策树**（commit `16abebf`）判断是否需要 archive 旧 sid + 创建新 sid：
 
-**dispatch 不修改 state 文件**——session 已在 prepare 时创建并持久化。
+   | 顺序 | 条件 | `reason` |
+   |------|------|----------|
+   | 1 | sid 在 OpenCode 找不到 | `missing` |
+   | 2 | `agent_task_marker != wt_task_marker` | `new-task` |
+   | 3 | `is_session_stale(ses, 1d)` | `stale (>1d)` |
+   | 4 | else | 复用 sid |
+
+5. 若需重建（`--yes` 模式）：
+   - `ensure_session(recreate_existing=True)` → archive 旧 sid + 创建新 sid
+   - `persist_session` 写 `state.{agent}_session_id`
+   - `update_state` 写 `state.{agent}_task_marker = wt_task_marker`（同步 marker，下次同 agent 同任务走复用分支）
+6. `POST /session/{sid}/prompt_async` 异步发送 prompt
+7. 可选 `--notify-session`：spawn `idle-watch` 后台进程，监听 session busy→idle 后通知 PM
+
+**dispatch 现在会修改 state 文件**（auto-create 路径）——与之前"dispatch 不修改 state"的旧语义相反。
 
 ### 3.5 release：释放 worktree
 
 1. **持 `pool_lock`**
 2. 检查 worktree 是否 dirty：dirty 时拒绝（除非 `--force`，则 `git reset --hard && git clean -fd`）
 3. `git reset --hard <base_ref>` + `git checkout <base_ref>` 回到基线
-4. **`cleanup_stale_sessions`**：删除 >1 天的旧 session（OpenCode session + state 条目），为下次 prepare 腾空间
+4. **`cleanup_stale_sessions`**：删除 >1 天的旧 session（OpenCode session + state 条目），回收 storage
 5. **`update_state`**：`status=idle`，`branch=""`
 
 **关键**：release 只清理 state 指针和 stale session，不删除还在 1 天内的近期 session。这些 session 作为历史记录保留在 OpenCode 中，overview 可通过 recent filter 查看。
@@ -151,10 +175,10 @@ pool init ──→ [idle] ──→ prepare ──→ [busy] ──→ dispatch
 
 ### 4.2 ensure_pool_sessions 流程
 
-`prepare` 和 `pool repair` 调用此函数保证 worktree 上有可用的 agent session：
+**已无调用方**——`pool prepare` 在 commit `653b827` 之后、`pool repair` 在 commit `16abebf` 之后都不再调此函数。函数保留供未来可能的 `pool prewarm` 类命令使用。
 
 ```
-ensure_pool_sessions(wt_id, agents, recreate_always=True):
+ensure_pool_sessions(wt_id, agents, recreate_always=True):  # currently unused
   for agent in [Daedalus, Themis, QA, Morpheus]:
     ensure_session(agent):
       1. 查 state 文件中的 *_session_id
@@ -165,14 +189,18 @@ ensure_pool_sessions(wt_id, agents, recreate_always=True):
       → watch_session(sid)
 ```
 
+**当前 session 创建的唯一入口**：`cmd_dispatch` 的 auto-create 路径（详见 §3.4 决策树）。`pool repair` 和 `pool init` 都只做 wt 物理 + state 修复/初始化，不再预创建 sessions。
+
 ### 4.3 Stale session 清理
 
 ```
 session 过期判定: time.updated > 1 day (STALE_SESSION_MS_DEFAULT)
 
 release 时: cleanup_stale_sessions() → 删除过期 session 的 OpenCode 记录 + state 条目
-prepare 时: recreate_always=True → 无条件重建（跨任务隔离）
+dispatch 时（auto-create 路径）: is_session_stale(ses, 1d) → 触发 reason=stale (>1d) 重建
 ```
+
+`prepare` 不再处理 stale session（commit `653b827`）—— stale 检测完全在 dispatch 决策树里完成（详见 §3.4）。
 
 ## 5. Round-Robin 与并发控制
 
@@ -265,7 +293,19 @@ watch:
 
 **二者来源不同，结果天然不一致**。要让 status 与 overview 对齐，需要统一发现逻辑（都用 OpenCode API）并增加 unwatch 清理。
 
-### 7.2 当前差距
+### 7.2 默认隐藏 unwatch / unknown + 占位行（commit `63d051c`）
+
+`overview` 默认隐藏 sidecar 状态为 `unwatch` / `unknown` 的 session（避免视觉噪音）。当某个 wt 内的所有 session **全部**被隐藏时，overview 打印一行占位：
+
+```
+wt_5  <branch>  <commit>  clean  <Δ>  (无)  ...  (9 unwatch/unknown sessions hidden; pass --show-unwatch)
+```
+
+占位让 wt 不再"消失"——这是 commit `4eedee3` 之后的关键 UX 改进：全新 wt 的 sessions 都是 unwatch（从未 dispatch 过），默认隐藏后这些 wt 必须靠占位行才能被用户感知。
+
+用户想看完整列表（含 unwatch）：`overview --show-unwatch`。
+
+### 7.3 当前差距
 
 以实际运行数据为例（2026-06-12）：
 

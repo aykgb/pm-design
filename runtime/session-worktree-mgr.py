@@ -33,6 +33,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -738,8 +739,9 @@ def cleanup_stale_sessions(
     history/inspection and is still visible via ``sessions list``.
 
     Used by ``release`` to keep the worktree's session pool fresh and
-    bounded. Pairs with ``ensure_pool_sessions`` at prepare time: release
-    evicts old, prepare re-creates.
+    bounded. ``pool prepare`` no longer recreates sessions — that moved
+    to ``cmd_dispatch`` (auto-create on first use, recreate_existing=True),
+    so release and dispatch are no longer paired by prepare in the middle.
 
     Returns the list of ``(agent, session_id)`` tuples whose state pointers
     were archived. Also prunes the ``deleted_session_ids`` tombstone field
@@ -833,30 +835,32 @@ def ensure_session(
 ) -> dict[str, Any]:
     """Return a usable session for ``(wt_id, agent)``.
 
-    Lookup order:
-      1. state ``*_session_id`` + ``get_session_by_id`` (still in OpenCode).
-         The fast path also honors ``state['deleted_session_ids']``: if the
-         pinned sid was soft-deleted via ``sessions delete``, the state
-         pointer is bypassed and we fall through to step 2 — the user
-         explicitly tombstoned it and we must not resurrect it.
-      2. fallback: ``find_session_by_title`` (e.g. state was lost), skipping
-         any soft-deleted sids in ``state['deleted_session_ids']`` (P1-5 —
-         the user explicitly tombstoned these via ``sessions delete``, so
-         we must not resurrect them as the "current" session)
-      3. create new session via ``create_session``
+        Lookup order:
+          1. state ``*_session_id`` + ``get_session_by_id`` (still in OpenCode).
+             The fast path also honors ``state['deleted_session_ids']``: if the
+             pinned sid was soft-deleted via ``sessions delete``, the state
+             pointer is bypassed and we fall through to step 2 — the user
+             explicitly tombstoned it and we must not resurrect it.
+          2. fallback: ``find_session_by_title`` (e.g. state was lost), skipping
+             any soft-deleted sids in ``state['deleted_session_ids']`` (P1-5 —
+             the user explicitly tombstoned these via ``sessions delete``, so
+             we must not resurrect them as the "current" session)
+          3. create new session via ``create_session``
 
-    With ``recreate_stale=True``, sessions whose ``time.updated`` exceeds
-    ``max_age_ms`` are ARCHIVED (unwatched, left in OpenCode for later
-    inspection — cache is cold, conversation history is no longer useful)
-    and a fresh session is created instead. This is the "grab-time
-    refresh" behavior used by ``ensure_pool_sessions``.
+        With ``recreate_stale=True``, sessions whose ``time.updated`` exceeds
+        ``max_age_ms`` are ARCHIVED (unwatched, left in OpenCode for later
+        inspection — cache is cold, conversation history is no longer useful)
+        and a fresh session is created instead. This is the "grab-time
+        refresh" behavior used by ``ensure_pool_sessions``.
 
     With ``recreate_existing=True``, ANY existing session (state-pinned or
-    title-found) is archived first (unwatched, left in OpenCode) and a
-    fresh session is created. This is the "always-fresh" behavior used by
-    ``cmd_prepare`` to guarantee that every new task gets a brand-new
-    session (no cross-task reuse), while repair / init / per-dispatch
-    loops still preserve session continuity.
+        title-found) is archived first (unwatched, left in OpenCode) and a
+        fresh session is created. This is the "always-fresh" behavior used by
+        ``cmd_dispatch`` auto-create fallback (cold-start context on first
+        use) and by ``pool continue`` to reset a stuck session. Per-dispatch
+        loops within the same task still reuse the session — dispatch only
+        calls ``ensure_session(recreate_existing=True)`` when the existing
+        sid is missing or stale.
     """
     title = f"{wt_id}-{agent}"
     state = read_state(config, wt_id)
@@ -1240,7 +1244,32 @@ def create_or_reuse_worktree(config: Config, wt_id: str) -> Path:
     return wt_path
 
 
-def repair_one(config: Config, wt_id: str, agents: list[str], *, reset: bool, force_copy: bool) -> dict[str, Any]:
+def repair_one(
+    config: Config,
+    wt_id: str,
+    agents: list[str],
+    *,
+    reset: bool,
+    force_copy: bool,
+    create_sessions: bool = False,
+) -> dict[str, Any]:
+    """Create or repair a single worktree (physical + state).
+
+    Both current call sites pass ``create_sessions=False``: ``pool init``
+    and ``pool repair`` (after commit ``16abebf``) only produce the wt
+    directory, the ``.opencode/node_modules`` copy, and the state file
+    (``initialized=1``). Sessions are created lazily by ``cmd_dispatch``
+    auto-create on first use. The parameter is retained for future
+    flexibility — e.g. a hypothetical ``pool prewarm`` command that wants
+    to pre-create sessions for all agents without forcing a dispatch.
+
+    Skipping session creation at init/repair time avoids leaving unused
+    preallocated sessions on every freshly initialized wt (they showed up
+    as ``unknown`` in sidecar ``/status`` and triggered the overview
+    placeholder row for never-dispatched wts). Pool size grew but actual
+    dispatch utilization was uneven across agents per wt, so a typical wt
+    ended up with 2-3 sessions that never saw a single prompt.
+    """
     validate_wt_id(wt_id)
     wt_path = create_or_reuse_worktree(config, wt_id)
     if reset:
@@ -1259,7 +1288,9 @@ def repair_one(config: Config, wt_id: str, agents: list[str], *, reset: bool, fo
         }
     )
     write_state(config, wt_id, state)
-    session_results = []
+    session_results: list[dict[str, Any]] = []
+    if not create_sessions:
+        return {"wt_id": wt_id, "wt_path": str(wt_path), "sessions": session_results}
     for agent in agents:
         session = ensure_session(config, wt_id, wt_path, agent, recreate_missing=True)
         persist_session(config, wt_id, agent, session)
@@ -1302,20 +1333,23 @@ def ensure_pool_sessions(
     recreate_stale: bool = True,
     recreate_always: bool = False,
 ) -> list[dict[str, Any]]:
-    """Ensure each agent has a fresh, valid session — create if missing or stale.
+    """Ensure each agent has a valid session — create if missing or stale.
 
-    Companion to ``cleanup_stale_sessions`` (called by ``release``):
-    release evicts old sessions; ensure_pool_sessions (called by ``prepare``)
-    re-creates them so the wt is ready for dispatch.
+    Used by ``cmd_pool_repair`` (which sets ``recreate_always=True`` to
+    batch-precreate one fresh session per agent on the freshly initialized
+    wt). NOT called by ``cmd_prepare`` anymore — prepare moved session
+    creation to ``cmd_dispatch`` (auto-create on first use).
 
     With ``recreate_stale=True`` (default), sessions older than
-    ``STALE_SESSION_MS_DEFAULT`` (1 day) are deleted and replaced.
+    ``STALE_SESSION_MS_DEFAULT`` (1 day) are archived (unwatched, left in
+    OpenCode for later inspection — cache is cold, conversation history is
+    no longer useful) and a fresh session is created instead.
 
-    With ``recreate_always=True`` (used by ``cmd_prepare``), every existing
-    session is deleted and replaced — guarantees no cross-task session
-    reuse, so a new task starts with a cold cache and zero history from
-    previous tasks. Per-dispatch loops within the same task still reuse
-    the session (dispatch itself does not call this function).
+    With ``recreate_always=True`` (used by ``cmd_pool_repair``), every
+    existing session is archived first and a fresh one created. This
+    guarantees no cross-task session reuse — a fresh task starts with a
+    cold cache and zero history from previous tasks. Per-dispatch loops
+    within the same task still reuse the session.
     """
     results: list[dict[str, Any]] = []
     for agent in agents:
@@ -1345,15 +1379,54 @@ def cmd_pool_init(args: argparse.Namespace, config: Config) -> None:
         for i in range(1, args.size + 1):
             wt_id = wt_id_for_index(i)
             eprint(f"== pool init {wt_id} ==")
-            results.append(repair_one(config, wt_id, agents, reset=args.reset, force_copy=args.force_copy))
+            # pool init no longer pre-creates agent sessions — they show up
+            # as ``unknown`` in sidecar /status until first dispatch, and a
+            # freshly initialized wt often ends up with 2-3 agents that
+            # never see a prompt. Sessions are created lazily on the first
+            # ``dispatch`` (see cmd_dispatch auto-create fallback) or
+            # eagerly via ``pool prepare`` / ``pool repair``.
+            results.append(
+                repair_one(
+                    config,
+                    wt_id,
+                    agents,
+                    reset=args.reset,
+                    force_copy=args.force_copy,
+                    create_sessions=False,
+                )
+            )
     print(json.dumps({"pool_dir": str(config.pool_dir), "results": results}, ensure_ascii=False, indent=2))
 
 
 def cmd_pool_repair(args: argparse.Namespace, config: Config) -> None:
+    """Repair a single wt — physical + state only, no session creation.
+
+    Scope: ``validate_wt_id`` → ``create_or_reuse_worktree`` → optional
+    ``reset_to_base`` → ``copy_opencode_node_modules`` → mark
+    ``initialized=1``. Sessions are NOT created here — that responsibility
+    moved entirely to ``cmd_dispatch`` auto-create (commit ``16abebf`` and
+    later). ``pool repair`` is now a thin wt-state fixup; for any session
+    work, the first dispatch on a fresh wt triggers creation on demand.
+
+    Sessions have never been "repaired" by this command in any meaningful
+    sense — before commit ``16abebf`` it pre-created sessions, but with the
+    dispatch task_marker decision tree the only legitimate reason to want
+    pre-creation was avoiding dispatch auto-create on first use. That
+    benefit is small (one ensure_session call per agent, ~ms-scale on
+    OpenCode) and not worth maintaining a separate code path that has to
+    stay in sync with dispatch's marker semantics.
+    """
     check_services(config)
     agents = parse_agents(args.agents)
     with pool_lock(config):
-        result = repair_one(config, args.wt_id, agents, reset=args.reset, force_copy=args.force_copy)
+        result = repair_one(
+            config,
+            args.wt_id,
+            agents,
+            reset=args.reset,
+            force_copy=args.force_copy,
+            create_sessions=False,
+        )
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 
@@ -1435,6 +1508,22 @@ def find_idle_wt(config: Config) -> tuple[str, Path]:
 
 
 def cmd_prepare(args: argparse.Namespace, config: Config) -> None:
+    """Reserve an idle wt for the task branch — does NOT touch sessions.
+
+    Sessions are created lazily by ``cmd_dispatch`` (auto-create on first
+    use, recreate_existing=True for cold-start context) or explicitly via
+    ``pool repair``. ``pool prepare`` is now scoped to wt state only:
+    pick idle wt, checkout branch, mark busy. No ensure_pool_sessions
+    call — that responsibility moved to dispatch so pool init / prepare
+    no longer pre-allocate unused sessions.
+
+    Each prepare generates a fresh ``task_marker`` (uuid4 hex) into the wt
+    state. ``cmd_dispatch`` compares this against the agent's stored
+    ``{agent}_task_marker``: a mismatch means a new task boundary was
+    crossed (e.g. release + re-prepare), so the agent's session must be
+    archived and a fresh one created. The uuid ensures even same-branch
+    re-prepares trigger the new-task recreate.
+    """
     check_services(config)
     agents = parse_agents(args.agents)
     with pool_lock(config):
@@ -1443,20 +1532,16 @@ def cmd_prepare(args: argparse.Namespace, config: Config) -> None:
             fail(f"selected worktree is dirty: {wt_path}; run release --force or pool repair")
         ensure_base_ref(config.repo, config.base_ref)
         checkout_task_branch(wt_path, config.repo, args.branch, config.base_ref, allow_existing=args.force_branch)
-        # Ensure each agent has a fresh, valid session. Pairs with the
-        # cleanup_stale_sessions() call inside cmd_release: release evicts
-        # stale (>1d) sessions, prepare re-creates them so the wt is ready.
-        # recreate_always=True guarantees no cross-task session reuse — every
-        # new prepare gets brand-new sessions (per-task isolation).
-        ensure_pool_sessions(
+        update_state(
             config,
             wt_id,
-            wt_path,
-            agents,
-            recreate_stale=True,
-            recreate_always=True,
+            {
+                "status": "busy",
+                "branch": args.branch,
+                "wt_path": str(wt_path),
+                "task_marker": uuid.uuid4().hex,
+            },
         )
-        update_state(config, wt_id, {"status": "busy", "branch": args.branch, "wt_path": str(wt_path)})
     print(f"wt_id={wt_id}")
     print(f"wt_path={wt_path}")
     print(f"branch={args.branch}")
@@ -1526,11 +1611,58 @@ def cmd_dispatch(args: argparse.Namespace, config: Config) -> None:
         state = read_state(config, wt_id)
         wt_path = Path(state.get("wt_path") or path_for_wt(config, wt_id)).resolve()
         agent = args.agent
-        sid = state.get(f"{agent}_session_id")
-        if not sid:
-            fail(f"{wt_id} missing {agent}_session_id; run pool repair {wt_id}")
-        if not get_session_by_id(config, sid, directory=wt_path):
-            fail(f"{wt_id} stale {agent}_session_id={sid}; run pool repair {wt_id}")
+        sid = state.get(f"{agent}_session_id") or ""
+        ses = get_session_by_id(config, sid, directory=wt_path) if sid else None
+        agent_marker = state.get(f"{agent}_task_marker", "")
+        wt_marker = state.get("task_marker", "")
+        # Decision tree for archive + recreate:
+        #   - no sid / OpenCode can't find it → "missing"
+        #   - task_marker changed since the agent's last create → "new-task"
+        #     (wt was re-prepared; even same-branch re-prepare gets a new uuid)
+        #   - session time.updated older than 1 day → "stale (>1d)"
+        # else: reuse the existing sid (same task, same agent, fresh cache).
+        needs_recreate = False
+        reason: str | None = None
+        if not ses:
+            needs_recreate = True
+            reason = "missing"
+        elif agent_marker != wt_marker:
+            needs_recreate = True
+            reason = "new-task"
+        elif is_session_stale(ses, max_age_ms=STALE_SESSION_MS_DEFAULT):
+            needs_recreate = True
+            reason = "stale (>1d)"
+        if needs_recreate and args.yes:
+            eprint(f"{wt_id} {agent} session {reason}; auto-creating fresh session")
+            new_ses = ensure_session(config, wt_id, wt_path, agent, recreate_existing=True)
+            sid = new_ses["id"]
+            persist_session(config, wt_id, agent, new_ses)
+            # Sync the agent's task_marker so the next dispatch of the same
+            # agent on the same wt_marker skips the new-task recreate.
+            update_state(config, wt_id, {f"{agent}_task_marker": wt_marker})
+        elif needs_recreate:
+            # Preview path: no side effects (no ensure_session, no
+            # persist_session, no watch_session with a fake sid). Tell the
+            # user what will happen on --yes and return.
+            provider_id, model_id, variant = opencode_model(config, agent)
+            model_label = f"{provider_id}/{model_id}" + (f":{variant}" if variant else "")
+            preview = {
+                "send": False,
+                "wt_id": wt_id,
+                "agent": agent,
+                "sessionID": f"(auto-create-on-execute: {reason})",
+                "auto_create": True,
+                "reason": reason,
+                "model": model_label,
+                "directory": str(wt_path),
+                "prompt": render_prompt(wt_path, args.task.strip()),
+            }
+            print(json.dumps(preview, ensure_ascii=False, indent=2))
+            print()
+            print("确认后执行 (--yes 会自动创建 session):")
+            notify_flag = f" --notify-session {args.notify_session}" if args.notify_session else ""
+            print(f"python3 scripts/session-worktree-mgr.py dispatch {args.wt_id} {agent} --task {json.dumps(args.task, ensure_ascii=False)} --yes{notify_flag}")
+            return
     watch_session(config, sid)
     status_map = http_json("GET", f"{config.sidecar}/status")
     session_status = "unknown"
@@ -2632,11 +2764,28 @@ def _print_session_rows(
 
     ``show_unwatch`` (default False) hides sessions whose sidecar state is
     ``unwatch``. Pass ``--show-unwatch`` to include them.
+
+    When ``show_unwatch=False`` filters every session out as ``unwatch`` /
+    ``unknown``, emit a single placeholder row carrying the wt header
+    (commit/dirty/Δmain) and a ``Session ID`` hint naming how many sessions
+    are hidden behind ``--show-unwatch``. Without this fallback an
+    all-unknown wt (e.g. freshly preallocated sessions that have never been
+    dispatched, so ``tokens.input == 0`` and sidecar never sees an idle
+    event) vanishes from the text overview even though ``--format json``
+    confirms it owns N sessions. Main worktree skip: its header is rendered
+    by the caller's PM group label, and per-group empty fallback is noisy.
     """
     is_main = wt["id"] == "xidi-minimal"
+    raw_count = len(sessions)
     if not show_unwatch:
         sessions = [s for s in sessions if str(status_map.get(s.get("id", "-"), "unwatch")) not in ("unwatch", "unknown")]
+    hidden = raw_count - len(sessions)
     if not sessions:
+        if hidden and not is_main:
+            prefix = f"  {wt['id']:<14} {wt['branch']:<40} {wt['commit']:<9} {wt['dirty']:<7} {wt['ahead_main']:<6}"
+            note = f"({hidden} unwatch/unknown session{'s' if hidden != 1 else ''} hidden; pass --show-unwatch)"
+            row = f"{prefix} {'(无)':<10} {'':<7} {'':<8} {'':<8} {'':<6} {'':<8} {'':<7} {'':<8} {note}"
+            print(row)
         return
     first = True
     for sess in sessions:
