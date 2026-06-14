@@ -3,17 +3,18 @@
 status.py — PM Workflow S(tatus) 的 Python 实现
 
 对应 skill：`.opencode/skills/pm-workflow-status/SKILL.md`
-对应 SKILL.md 「项目体检清单」一节的 8 项检查。
+对应 SKILL.md 「项目体检清单」一节的 9 项检查。
 
 本脚本作为 PM 文档的一部分，与 SKILL.md 同目录共存。
 仅读取仓库状态，不修改任何文件；不依赖项目应用代码（无 DB / 无 ORM / 无 QMT）。
 
 用法：
 
-    python .opencode/skills/pm-workflow-status/status.py            # 人读
-    python .opencode/skills/pm-workflow-status/status.py --json     # 机器可读
-    python .opencode/skills/pm-workflow-status/status.py --quiet    # 仅 fail 时输出
-    python .opencode/skills/pm-workflow-status/status.py --help     # 帮助
+    python .opencode/skills/pm-workflow-status/status.py                           # 人读
+    python .opencode/skills/pm-workflow-status/status.py --json                    # 机器可读
+    python .opencode/skills/pm-workflow-status/status.py --quiet                   # 仅 fail 时输出
+    python .opencode/skills/pm-workflow-status/status.py --pm-session-id ses_xxx   # 比对 guard block
+    python .opencode/skills/pm-workflow-status/status.py --help                    # 帮助
 
 退出码：
 
@@ -216,6 +217,48 @@ def check_pm_agent_alignment() -> CheckResult:
     )
 
 
+def check_pm_session_active() -> CheckResult:
+    """验证 pm-session-info.json 指向本 PM 会话（未被 guard block 到旧会话）"""
+    info_path = REPO_ROOT / ".pm" / "pm-session-info.json"
+    if not info_path.exists():
+        return CheckResult(
+            name="pm_session_active",
+            status="fail",
+            expected="pm-session-info.json exists",
+            actual="(file not found)",
+        )
+    try:
+        data = json.loads(info_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError):
+        return CheckResult(
+            name="pm_session_active",
+            status="fail",
+            expected="valid JSON",
+            actual="(unreadable)",
+        )
+    file_sid = str(data.get("current_session_id") or "")
+    if not _pm_session_id:
+        return CheckResult(
+            name="pm_session_active",
+            status="warn",
+            expected="--pm-session-id 传入本会话 ID 后可自动比对",
+            actual=f"session={file_sid[:20]}... (未传入，跳过比对)",
+        )
+    if file_sid == _pm_session_id:
+        return CheckResult(
+            name="pm_session_active",
+            status="pass",
+            expected=f"current_session_id = {_pm_session_id[:20]}...",
+            actual="match",
+        )
+    return CheckResult(
+        name="pm_session_active",
+        status="fail",
+        expected=f"current_session_id = {_pm_session_id[:20]}...",
+        actual=f"current_session_id = {file_sid[:20]}... (guard blocked — takeover needed)",
+    )
+
+
 # 注册表：顺序与 SKILL.md 体检清单一致
 ALL_CHECKS: list[Callable[[], CheckResult]] = [
     check_worktree_clean,
@@ -226,10 +269,14 @@ ALL_CHECKS: list[Callable[[], CheckResult]] = [
     check_db_migration,
     check_runtime_config_defaults,
     check_pm_agent_alignment,
+    check_pm_session_active,
 ]
 
 
 SYMBOL = {"pass": "✔", "warn": "⚠", "fail": "✘", "skip": "⏭"}
+
+# 模块级变量：由 CLI --pm-session-id 传入，供 check_pm_session_active 比对
+_pm_session_id: str = ""
 
 
 # ============================================================
@@ -261,10 +308,14 @@ def render_human(checks: list[CheckResult]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="PM Workflow S(tatus) — 项目健康度快速扫描（8 项检查）")
+    parser = argparse.ArgumentParser(description="PM Workflow S(tatus) — 项目健康度快速扫描（9 项检查）")
     parser.add_argument("--json", action="store_true", help="输出 JSON 格式")
     parser.add_argument("--quiet", action="store_true", help="仅在有 fail 时输出")
+    parser.add_argument("--pm-session-id", default="", help="当前 PM 会话 ID（用于比对 pm-session-info.json 是否被 guard block）")
     args = parser.parse_args(argv)
+
+    global _pm_session_id
+    _pm_session_id = args.pm_session_id
 
     checks = collect_checks()
     fail_count = sum(1 for c in checks if c.status == "fail")
