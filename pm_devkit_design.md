@@ -39,7 +39,7 @@ Last updated: 2026-06-13
 | **Spec 拆解 & Batch** | [specs/spec-breakdown.md](specs/spec-breakdown.md) | Spec 拆解 8 步流程、Batch 合并/拆分原则、规模阈值 |
 | **Workflow 体系** | [specs/workflow-system.md](specs/workflow-system.md) | I/S/N/F/L/M/R/B 8 个 Workflow、核心链、模式切换 |
 | **运行时架构** | [specs/runtime-architecture.md](specs/runtime-architecture.md) | OpenCode 引擎分层、异步调度、Worktree Pool、迭代自愈 |
-| **Session/Worktree 管理** | [specs/worktree-session-mgmt.md](specs/worktree-session-mgmt.md) | Worktree/Session 状态体系、生命周期、持久化、sidecar 集成 |
+| **Session/Worktree 管理** | [specs/session_worktree_design.md](specs/session_worktree_design.md) | Worktree/Session 状态体系、生命周期、持久化、sidecar 集成 |
 | **文件体系 & 约定** | [specs/file-conventions.md](specs/file-conventions.md) | PM 域目录结构、Task 状态机、提交权限、Backlog |
 
 ## 模板目录
@@ -54,7 +54,7 @@ Last updated: 2026-06-13
 | 目录 | 内容 |
 |------|------|
 | [skills/](skills/) | 8 个 `pm-workflow-*` skill（PM 工作流引擎，bootstrap 时复制到项目 `.opencode/skills/`） |
-| [runtime/](runtime/) | `session-worktree-mgr.py` / `session-status-server.mjs` / `check-codex.sh` / `session-worktree-mgr.md`（bootstrap 时复制到项目 `scripts/`） |
+| [runtime/](runtime/) | `session-worktree-mgr.py` / `session-status-server.mjs` / `check-codex.sh` / `session_worktree_usage.md`（bootstrap 时复制到项目 `scripts/`） |
 | [scripts/](scripts/) | `pm-bootstrap.py`（bootstrap 入口） |
 
 ## 决策记录
