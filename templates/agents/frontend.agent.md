@@ -1,5 +1,5 @@
 ---
-name: Morpheus
+name: {{agent_name}}
 description: <项目名> 的前端开发 Agent。实现静态 HTML / 原生 JS / ECharts 前端页面。不动后端/DB/交易核心。
 mode: all
 temperature: 0.2

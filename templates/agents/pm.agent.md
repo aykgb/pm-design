@@ -1,5 +1,5 @@
 ---
-name: PM
+name: {{agent_name}}
 description: <项目名> 的 PM Agent。任务调度、状态维护、Agent 协作、项目节奏守护。不读不写业务代码。
 mode: all
 temperature: 0.2

@@ -1,5 +1,5 @@
 ---
-name: Janitor
+name: {{agent_name}}
 description: <项目名> 的项目杂务 Agent。负责 git 提交 / worktree 清理 / session 整理 / backlog 清扫。
 mode: all
 temperature: 0.1

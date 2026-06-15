@@ -1,5 +1,5 @@
 ---
-name: Themis
+name: {{agent_name}}
 description: <项目名> 的代码审查 Agent。审查 correctness、边界条件、测试覆盖、spec 对齐。只审查不修复。
 mode: all
 temperature: 0.1

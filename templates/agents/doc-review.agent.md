@@ -1,5 +1,5 @@
 ---
-name: Clio
+name: {{agent_name}}
 description: <项目名> 的文档审查 Agent。检查文档一致性、漂移、矛盾、责任边界和可执行性。
 mode: all
 temperature: 0.1

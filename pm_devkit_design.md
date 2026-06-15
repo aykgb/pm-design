@@ -54,8 +54,20 @@ Last updated: 2026-06-13
 | 目录 | 内容 |
 |------|------|
 | [skills/](skills/) | 8 个 `pm-workflow-*` skill（PM 工作流引擎，bootstrap 时复制到项目 `.opencode/skills/`） |
-| [runtime/](runtime/) | `session-worktree-mgr.py` / `session-status-server.mjs` / `check-codex.sh` / `session_worktree_usage.md`（bootstrap 时复制到项目 `scripts/`） |
+| [runtime/](runtime/) | `session-worktree-mgr.py` / `session-status-server.mjs` / `check-codex.sh` / `session_worktree_usage.md`（bootstrap 时复制到项目 `scripts/`；`.md` 文档改复制到 `docs/session-worktree-usage.md`，per M2 修复） |
 | [scripts/](scripts/) | `pm-bootstrap.py`（bootstrap 入口） |
+| [plugins/](plugins/) | `pm-guardian.conf.json` + `pm-guardian.js`（PM 守护插件：PM session 启动/停止 hook + 配置 schema 校验。bootstrap 时按扩展名分发：`.js` → `.opencode/plugins/`，`.json` → `.pm/`） |
+
+## OpenCode 内置 agent 关系
+
+[templates/opencode.json](templates/opencode.json) 含 11 个 agent 配置，其中 3 个**不**在 [templates/agents/](templates/agents/) 模板目录：
+
+| Agent | 类型 | 来源 | 与 PM 工作方式关系 |
+|---|---|---|---|
+| `WebSearch` | subagent（fire-and-forget）| OpenCode 内置 | PM 派发 subagent 拉取外部信息（市场数据/技术文档）|
+| `General` | subagent（main session dispatch）| OpenCode 内置 | 工具链代码维护（per `file-conventions.md §4`）|
+| `explore` | subagent（main session dispatch）| OpenCode 内置 | 代码理解委派（per `pm.agent.md` Role 段）|
+| `plan` / `build` | subagent | OpenCode 内置 | **`opencode.json` 显式 `disable: true`**（per M3 决议）—— PM 自己 plan、开发 agent 接管 build，**不**用 OpenCode 内置 subagent，避免与 PM 委派模型冲突 |
 
 ## 决策记录
 

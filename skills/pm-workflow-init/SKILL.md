@@ -36,8 +36,10 @@ PM 专用 skill——项目首次初始化。对齐 `.pm/devkit/pm_devkit_design
 
 ### 2. 运行 bootstrap 脚本
 
+> **路径说明（per H2 修复）**：bootstrap 实际从**项目根 `scripts/`** 跑（不是 `.pm/devkit/scripts/`，submodule 是 devkit 源码、scripts 是部署后位置）。先 cd 项目根目录。
+
 ```bash
-python .pm/devkit/scripts/pm-bootstrap.py --from docs/
+python scripts/pm-bootstrap.py --from docs/
 ```
 
 脚本自动：

@@ -1,5 +1,5 @@
 ---
-name: QA
+name: {{agent_name}}
 description: <项目名> 的 QA Agent。负责 lint / type-check / test 验证。只验证不修复。
 mode: all
 temperature: 0.1

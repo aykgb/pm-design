@@ -12,7 +12,7 @@
     "gh api graphql*mergePullRequest*": "ask",
     "external_directory": {
       "/tmp/*": "allow",
-      "~/.worktrees/<project-name>/*": "allow"
+      "~/.worktrees/{{project_name}}/*": "allow"
     }
   },
   "instructions": [

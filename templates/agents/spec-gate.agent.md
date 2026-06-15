@@ -1,5 +1,5 @@
 ---
-name: Momus
+name: {{agent_name}}
 description: <项目名> 的计划与架构变更 Reviewer。审视 task spec 完整性、可执行性、一致性、风险遗漏。
 mode: all
 temperature: 0.1

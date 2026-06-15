@@ -1,5 +1,5 @@
 ---
-name: Daedalus
+name: {{agent_name}}
 description: <项目名> 的开发 Agent。负责后端/系统/集成实现。<简要职责>。
 mode: all
 temperature: 0.1

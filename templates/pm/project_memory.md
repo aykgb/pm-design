@@ -8,7 +8,7 @@ Last update: YYYY-MM-DD
 
 ## Recurring Project Context
 
-- **项目**：<项目名>
+- **项目**：{{project_name}}
 - **当前 Phase**：Phase N — <描述>
 - **Tests**：<N>
 

@@ -280,27 +280,48 @@ def copy_skills(dry_run: bool) -> tuple[int, int]:
 
 
 def copy_runtime_scripts(dry_run: bool) -> tuple[int, int]:
-    """Copy runtime scripts (session-worktree-mgr.py, etc.) from pm-devkit to project scripts/. Returns (copied, skipped)."""
+    """Copy runtime scripts from pm-devkit to project scripts/ — 扩展名白名单 (per M2 修复).
+
+    仅复制 .py / .sh / .mjs (可执行脚本). .md 文档 (如 session_worktree_usage.md)
+    改复制到 docs/session-worktree-usage.md — 不污染 scripts/ 命名空间.
+
+    Returns (copied, skipped). 跨目录复制 (脚本→scripts + 文档→docs) 合并计数.
+    """
     if not RUNTIME_DIR.exists():
         return 0, 0
 
     copied, skipped = 0, 0
-    target_base = PROJECT_ROOT / "scripts"
+    target_scripts = PROJECT_ROOT / "scripts"
+    target_docs = PROJECT_ROOT / "docs"
+    script_exts = {".py", ".sh", ".mjs"}
 
     for src in RUNTIME_DIR.iterdir():
         if not src.is_file() or src.name.startswith("."):
             continue
-        dst = target_base / src.name
+        if src.suffix in script_exts:
+            dst = target_scripts / src.name
+            target_dir = target_scripts
+        elif src.suffix == ".md":
+            # 文档复制到 docs/ — 命名规范化: session_worktree_usage.md →
+            # session-worktree-usage.md (改下划线为短横线, 与 docs/ 已有文件命名一致)
+            if "_usage" in src.name:
+                doc_name = src.name.replace("_usage", "-usage")
+            else:
+                doc_name = src.name
+            dst = target_docs / doc_name
+            target_dir = target_docs
+        else:
+            continue
         if dst.exists():
             skipped += 1
             continue
         if dry_run:
-            print(f"   📄 将复制 runtime: {src.name}")
+            print(f"   📄 将复制 runtime → {target_dir.relative_to(PROJECT_ROOT)}/{src.name}")
         else:
-            target_base.mkdir(parents=True, exist_ok=True)
+            target_dir.mkdir(parents=True, exist_ok=True)
             import shutil
             shutil.copy2(src, dst)
-            print(f"   ✅ 复制 runtime: {src.name}")
+            print(f"   ✅ 复制 runtime → {target_dir.relative_to(PROJECT_ROOT)}/{src.name}")
         copied += 1
 
     return copied, skipped
@@ -386,8 +407,19 @@ def main() -> None:
     generated = 0
     skipped = 0
 
-    # PM templates
-    for name in ["project_memory.md", "operational_conventions.md", "persona.md"]:
+    # PM templates — 5 文件 (per file-conventions.md §1 L10-15 + per B3 修复:
+    #   补齐 user_profile.md + user_behavior.md 模板, 与 path B 手工创建表格 7 文件
+    #   中的 2 个空模板对应 — 7 文件中剩 2 个 (project_memory.md +
+    #   operational_conventions.md + persona.md + chats/INDEX.md + reflections/)
+    #   通过本循环 (project_memory.md/operational_conventions.md/persona.md)
+    #   + 内联生成 (chats/INDEX.md) + mkdir (reflections/) 覆盖)
+    for name in [
+        "project_memory.md",
+        "operational_conventions.md",
+        "persona.md",
+        "user_profile.md",
+        "user_behavior.md",
+    ]:
         tpl = TEMPLATES_PM / name
         tgt = PROJECT_ROOT / ".pm" / name
         if generate_file(tpl, tgt, config, args.dry_run):
@@ -404,6 +436,9 @@ def main() -> None:
         skipped += 1
 
     # Agent templates
+    # 把 agent_name 注入 config copy — substitute() 用它替换模板 frontmatter
+    # `name: {{agent_name}}` 占位符 (per B1 修复). 不修改 config 自身以免污染
+    # 后续 generate_file 调用 (PM agent + generate_pm_config + opencode.json).
     for key, tpl_name in [
         ("dev_agent", "dev.agent.md"),
         ("review_agent", "review.agent.md"),
@@ -416,15 +451,17 @@ def main() -> None:
         tpl = TEMPLATES_AGENTS / tpl_name
         agent_name = config[key]
         tgt = PROJECT_ROOT / ".opencode" / "agents" / f"{agent_name.lower()}.md"
-        if generate_file(tpl, tgt, config, args.dry_run):
+        cfg_with_name = {**config, "agent_name": agent_name}
+        if generate_file(tpl, tgt, cfg_with_name, args.dry_run):
             generated += 1
         elif tgt.exists():
             skipped += 1
 
-    # PM agent（名称固定为 PM）
+    # PM agent (名称固定为 "PM"; frontmatter `name: {{agent_name}}` 替换为 "PM")
     pm_tpl = TEMPLATES_AGENTS / "pm.agent.md"
     pm_tgt = PROJECT_ROOT / ".opencode" / "agents" / "pm.md"
-    if generate_file(pm_tpl, pm_tgt, config, args.dry_run):
+    cfg_with_pm = {**config, "agent_name": "PM"}
+    if generate_file(pm_tpl, pm_tgt, cfg_with_pm, args.dry_run):
         generated += 1
     elif pm_tgt.exists():
         skipped += 1
@@ -440,18 +477,25 @@ def main() -> None:
             if fn(args.dry_run):
                 generated += 1
 
-    # Copy opencode.json config（如不存在，不做占位符替换——用户手工改 <project-name>）
+    # Copy opencode.json config — 占位符替换 (per H1 修复).
+    # opencode.json L15 `~/.worktrees/{{project_name}}/*` 必须从 git remote
+    # 推断或 pm.config.yaml 读取项目名. 与 PM templates / agent templates
+    # 占位符形式保持一致 ({{xxx}}). 开发者改 pm.config.yaml 的 project.name
+    # 后重跑 bootstrap 会更新此文件 (前提: --from docs/ 路径能推断新 project_name).
     opencode_tpl = DESIGN_DIR / "templates" / "opencode.json"
     opencode_tgt = PROJECT_ROOT / ".opencode" / "opencode.json"
     if opencode_tpl.exists() and not opencode_tgt.exists():
         if args.dry_run:
-            print(f"   📄 将复制: {opencode_tgt}")
+            print(f"   📄 将复制: {opencode_tgt} (含 {{project_name}} 替换)")
             generated += 1
         else:
             import shutil
             opencode_tgt.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(opencode_tpl, opencode_tgt)
-            print(f"   ✅ 复制: opencode.json → .opencode/")
+            # 占位符替换 (与 generate_file 一致); opencode.json 仅含 {{project_name}} 占位符
+            content = opencode_tpl.read_text(encoding="utf-8")
+            content = substitute(content, config)
+            opencode_tgt.write_text(content, encoding="utf-8")
+            print(f"   ✅ 复制: opencode.json → .opencode/ (project_name 替换)")
             generated += 1
     elif opencode_tgt.exists():
         skipped += 1
