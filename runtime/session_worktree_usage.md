@@ -53,7 +53,7 @@ wt_5  <branch>  <commit>  clean  <Δ>  (无)  ...  (9 unwatch sessions hidden; p
 python3 scripts/session-worktree-mgr.py session show ses_xxx
 python3 scripts/session-worktree-mgr.py session status ses_xxx
 python3 scripts/session-worktree-mgr.py session last ses_xxx
-python3 scripts/session-worktree-mgr.py session dispatch ses_xxx --task '...' --yes
+python3 scripts/session-worktree-mgr.py session dispatch ses_xxx --task '...' --yes [--pm-session-id <sid>]
 ```
 
 > **`--task` 引号**：有括号 `()`、`$`、反引号等特殊字符时，务必用**单引号** `'...'`（zsh 原样传递，不做任何解析）。双引号 `"..."` 会触发命令替换，如 `recent_pm_state_files()` 被解析为函数调用而报 `parse error`。多行 prompt 单引号也直接支持，无需临时文件。
@@ -64,10 +64,47 @@ python3 scripts/session-worktree-mgr.py session dispatch ses_xxx --task '...' --
 
 ```bash
 python3 scripts/session-worktree-mgr.py sessions list --wt wt_1
-python3 scripts/session-worktree-mgr.py sessions list --main
+python3 scripts/session-worktree-mgr.py sessions list --main [--pm-session-id <sid>]
 python3 scripts/session-worktree-mgr.py sessions list --wt wt_1 --agent Daedalus
-python3 scripts/session-worktree-mgr.py sessions create --agent Janitor
+python3 scripts/session-worktree-mgr.py sessions create --agent Janitor [--pm-session-id <sid>]
 ```
+
+### PM Session 隔离与 main.state
+
+Main agent（General / Momus / Janitor / Clio）的 session 按 PM session 隔离，元数据存储在：
+
+```
+~/.worktrees/<project>/.state/sessions/<pm_session_id>/main.state
+```
+
+#### main.state 格式
+
+每行 `{agent}_session_id=ses_xxx` / `{agent}_session_title=main-{agent}`：
+
+```
+general_session_id=ses_1227c8919ffeuRlSw4qXVzSIsV
+general_session_title=main-general
+momus_session_id=ses_148a0858dffeWxqoM20er84ZUT
+momus_session_title=main-Momus
+```
+
+#### `--pm-session-id` 传递链路
+
+- **CLI flag**：`--pm-session-id <sid>` 显式传入
+- **环境变量**：`PM_SESSION_ID`（优先级高于 `.pm/pm-session-info.json`）
+- **Config.load()**：自动读取 `PM_SESSION_ID` env 或 `pm-session-info.json`
+- 不传 `--pm-session-id` 且 env 未设 → legacy 兼容模式（不过滤归属，返回全量）
+
+#### 操作行为
+
+| 操作 | 行为 |
+|------|------|
+| `sessions list --main --pm-session-id <sid>` | 只返回当前 PM 的 main.state 中记录的 session |
+| `session dispatch <sid>` | 校验目标 sid 必须在 main.state 中；不在 → 拒绝，提示先 `create` |
+| `session dispatch <sid>`（session >1d） | `--yes` 模式下自动 hard-delete 重建；preview 模式仅提示 |
+| `session dispatch <sid> --agent X`（agent 无记录） | `--yes` 模式下自动 create + persist + dispatch；preview 模式输出 JSON 错误 |
+| `sessions create --agent X` | 已有 session 存在且 idle → 复用；**busy → 自动新建**（无需 `--force`）；>1d → 自动重建 |
+| 全量审计（跨 PM） | `overview --all` 走 OpenCode API，不受 main.state 过滤 |
 
 ### Worktree pool
 
@@ -165,7 +202,7 @@ python3 scripts/session-worktree-mgr.py pool release wt_1
 
 ## auto-compact（idle-watch 自动触发）
 
-dispatch 后 idle-watch 检测到 busy→idle 时，若 session context 超过 300K，自动做 summarize 压缩，完成后通知 PM。
+dispatch 后 idle-watch 检测到 busy→idle 时，若 session context 超过 350K，自动做 summarize 压缩，完成后通知 PM。
 
 **触发条件**：仅 `busy -> idle` 边沿 + one-shot 模式（`continuous` / `initial-idle` / `idle-after-update` 不触发）。
 
@@ -173,7 +210,7 @@ dispatch 后 idle-watch 检测到 busy→idle 时，若 session context 超过 3
 
 | 场景 | PM 收到的 notify |
 |------|-----------------|
-| context ≤ 300K，不触发 | （无，silent exit） |
+| context ≤ 350K，不触发 | （无，silent exit） |
 | compact 失败 | `[idle-notify:compact-failed] {error}` |
 | compact 成功 | `[idle-notify:compact-done] {before}K→{after}K` |
 | compact 期间 session 被复用 | `[idle-notify:compact-skipped] session reused` |

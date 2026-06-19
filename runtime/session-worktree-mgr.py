@@ -28,6 +28,11 @@ import contextlib
 import json
 import os
 import re
+
+try:
+    import fcntl  # POSIX-only; Windows falls back to best-effort (atomic os.replace only)
+except ImportError:  # pragma: no cover - non-POSIX fallback
+    fcntl = None  # type: ignore[assignment]
 import shutil
 import signal
 import subprocess
@@ -139,14 +144,18 @@ class Config:
         root = repo_root()
         op_port = int(env("OP_PORT", "4097"))
         sidecar_port = int(env("SIDECAR_PORT", "4107"))
-        pm_sid = ""
-        try:
-            info_path = root / ".pm" / "pm-session-info.json"
-            if info_path.exists():
-                info = json.loads(info_path.read_text(encoding="utf-8"))
-                pm_sid = str(info.get("current_session_id") or "")
-        except Exception:
-            pass
+        # PM scope precedence: PM_SESSION_ID env > .pm/pm-session-info.json
+        # > "" (legacy global main.state).  Env wins so callers and tests can
+        # pin scope without rewriting the JSON.
+        pm_sid = env("PM_SESSION_ID", "")
+        if not pm_sid:
+            try:
+                info_path = root / ".pm" / "pm-session-info.json"
+                if info_path.exists():
+                    info = json.loads(info_path.read_text(encoding="utf-8"))
+                    pm_sid = str(info.get("current_session_id") or "")
+            except Exception:
+                pass
         return cls(
             repo=root,
             pool_dir=Path(env("WORKTREE_POOL_DIR", str(Path.home() / ".worktrees" / root.name))).expanduser().resolve(),
@@ -355,15 +364,43 @@ def _read_state_file(path: Path) -> dict[str, str]:
 def _write_state_file(path: Path, values: dict[str, str]) -> None:
     """Write a standard ``key=value`` state file at an explicit path.
 
-    Atomic via temp-file + ``os.replace()``: writes to ``<path>.tmp`` first
-    and then renames over the target, so a concurrent ``update_state()`` from
-    a parallel dispatch cannot truncate the file mid-write. ``os.replace`` is
-    atomic on POSIX and Windows when the source and destination are on the
-    same filesystem.
+    Atomic via temp-file + ``os.replace()`` + ``fcntl.flock`` advisory lock
+    (per Codex PR #32 P2 fix). The lock serializes the read-modify-write
+    critical section against concurrent ``update_state()`` calls from a
+    parallel dispatch, preventing both:
+
+      - file-level race: two writers contending for the same ``.tmp`` path can
+        get ``FileNotFoundError`` if one unlinks mid-write
+      - logical lost-update: two callers both read the same initial state,
+        merge their own patches, and the second ``os.replace`` clobbers the
+        first writer's patch
+
+    ``os.replace`` is atomic on POSIX and Windows when the source and
+    destination are on the same filesystem.
     """
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = "".join(f"{k}={v}\n" for k, v in values.items())
     tmp_path = path.with_name(f".{path.name}.tmp")
+    lock_path = path.with_name(f".{path.name}.lock")
+
+    # Acquire exclusive advisory lock on a sibling lock file. flock() is
+    # automatically released when the fd is closed (incl. on SIGKILL of the
+    # holding process), so no orphan-cleanup is required.
+    if fcntl is not None:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            _do_atomic_state_write(tmp_path, path, payload)
+        finally:
+            os.close(lock_fd)
+    else:
+        # Windows / non-POSIX fallback: atomic write only (no cross-process
+        # serialization). Acceptable because the dispatcher is POSIX-only.
+        _do_atomic_state_write(tmp_path, path, payload)
+
+
+def _do_atomic_state_write(tmp_path: Path, path: Path, payload: str) -> None:
+    """Inner writer split out so the lock path can be reused by the fallback."""
     tmp_path.write_text(payload, encoding="utf-8")
     try:
         os.replace(tmp_path, path)
@@ -744,7 +781,7 @@ def delete_session(config: Config, session_id: str, *, hard: bool = False) -> No
 
 STALE_SESSION_MS_DEFAULT = 24 * 60 * 60 * 1000  # 1 day
 STALE_DISPATCH_MS = 10 * 60 * 1000  # 10 min — auto-recover stuck dispatch sessions
-MAX_MAIN_SESSION_CONTEXT = 300_000  # auto-compact main agent session when context exceeds this (>1d → rebuild)
+MAX_MAIN_SESSION_CONTEXT = 350_000  # auto-compact main agent session when context exceeds this (>1d → rebuild)
 
 # Default recent window for `cmd_overview` and `rewatch_all_sessions`.
 # Sessions whose `time.updated` is older than this are filtered out unless
@@ -1204,6 +1241,28 @@ def pid_alive(pid: int | None) -> TypeGuard[int]:
         return True
     except OSError:
         return False
+
+
+def _get_session_status(config: Config, session_id: str) -> str:
+    """Return the sidecar status for ``session_id`` (``idle``/``busy``/``streaming``/``unknown``).
+
+    Single read with no side effects.  ``unknown`` covers both HTTP failure
+    and "not in watch table"; callers treat it as "cannot prove busy" and
+    fall through to the safe path (re-use existing session).  This is
+    deliberately distinct from the idle-watch auto-register-and-refetch
+    variant — auto-watching on create would silently pin an untracked
+    session into the sidecar's table.
+    """
+    if not session_id:
+        return "unknown"
+    try:
+        status_map = http_json("GET", f"{config.sidecar}/status")
+    except SystemExit:
+        return "unknown"
+    if not isinstance(status_map, dict):
+        return "unknown"
+    raw = status_map.get(session_id, "unknown")
+    return str(raw) if isinstance(raw, str) else "unknown"
 
 
 def wait_until(fn: Callable[[], bool], timeout: int = 20) -> bool:
@@ -1702,6 +1761,16 @@ def cmd_prepare(args: argparse.Namespace, config: Config) -> None:
     print(f"已分配: {wt_id}")
 
 
+def _hard_constraints() -> str:
+    return """---
+⚠️ 硬约束：
+
+- 按 workflow 完成任务——不跳过 Checking / Testing / PR 步骤
+- 修改前先读目标文件和关联文件——禁止对路径/签名/契约做假设
+- 遇到阻塞不绕行——立即报告 blocker 与原因，禁止用 workaround/暂不确定/能跑就行为托词
+- 禁止使用 question 工具——直接报告 blocker，不中断流水线等待交互"""
+
+
 def render_prompt(wt_dir: Path, task: str, *, config: Config) -> str:
     is_main = wt_dir == config.repo
     header = f"<!-- wt: {wt_dir.name} -->" if not is_main else "<!-- wt: main -->"
@@ -1709,12 +1778,7 @@ def render_prompt(wt_dir: Path, task: str, *, config: Config) -> str:
 
 {task}
 
----
-⚠️ 硬约束：
-
-- 按 workflow 完成任务——不跳过 Checking / Testing / PR 步骤
-- 修改前先读目标文件和关联文件——禁止对路径/签名/契约做假设
-- 遇到阻塞不绕行——立即报告 blocker 与原因，禁止用 workaround/暂不确定/能跑就行为托词
+{_hard_constraints()}
 """
 
 
@@ -1743,16 +1807,80 @@ def cmd_dispatch(args: argparse.Namespace, config: Config) -> None:
         # Used for main-repo agents (Janitor/General) that have persistent
         # sessions created by `sessions create`.
         sid = args.session
+        # PM session ownership check: the sid must be present in the current
+        # PM's ``main.state`` under some ``{agent}_session_id`` field.
+        # Without this, a copy-pasted sid from a different PM conversation
+        # would silently overwrite another PM's main.state pointer.
+        main_state = read_main_state(config)
+        owned_key = None
+        for key, val in main_state.items():
+            if key.endswith("_session_id") and val == sid:
+                owned_key = key[: -len("_session_id")]
+                break
+        if not owned_key:
+            fail(f"session {sid} does not belong to current PM session {config.pm_session_id or '(unset)'}; use `{PROG} sessions create --agent <agent>` first.")
         ses = get_session_by_id(config, sid)
         if not ses:
             fail(f"session not found: {sid}")
         wt_path = Path(ses.get("directory") or str(config.repo)).resolve()
         wt_id = ses.get("metadata", {}).get("wt_id", "main")
-        agent = args.agent or str(ses.get("metadata", {}).get("agent") or ses.get("agent") or "")
+        # Agent precedence: CLI override > main.state ownership > session
+        # metadata.  main.state ownership is the most authoritative since
+        # ``sessions create --agent <X>`` pins the agent name explicitly.
+        agent = args.agent or owned_key or str(ses.get("metadata", {}).get("agent") or ses.get("agent") or "")
         if not agent:
             fail("--agent required when --session metadata has no agent")
         if not wt_path.is_dir():
             fail(f"session directory not found: {wt_path}")
+        # Stale-session guard: ``time.created`` (constant for session
+        # lifetime, unlike ``time.updated`` which races with long tasks)
+        # older than 1 day means the context has aged out.  Auto-rebuild
+        # before dispatching — same effect as ``sessions create --force``.
+        # Skip in preview mode (--yes=False): dry-run must not be destructive.
+        created_ms = int((ses.get("time") or {}).get("created") or 0)
+        if created_ms > 0 and (int(time.time() * 1000) - created_ms) > STALE_SESSION_MS_DEFAULT:
+            if not args.yes:
+                eprint(f"session {sid} created >1d ago; pass --yes to rebuild ({agent})")
+            else:
+                eprint(f"session {sid} created >1d ago; auto-rebuilding ({agent})...")
+                delete_session(config, sid, hard=True)
+                new_ses = create_session(config, "main", wt_path, agent)
+                sid = new_ses["id"]
+                ses = new_ses
+                persist_main_session(config, agent, new_ses)
+                # Refresh local main_state so the agent-missing guard below
+                # sees the freshly-persisted pointer; otherwise a dispatch
+                # where args.agent=X and the sid was owned by agent Y would
+                # create the session twice (stale rebuild for X, then
+                # agent-missing guard for X).
+                main_state = read_main_state(config)
+        # Agent-missing guard: --agent was set but main.state has no entry
+        # for it (the owned sid belongs to a different agent).  Auto-create
+        # the requested agent's session in the main repo so the dispatch
+        # lands on the right session.  Skip in preview mode: a destructive
+        # create-then-persist in dry-run is unsafe.
+        if args.agent and main_state.get(f"{args.agent}_session_id") is None:
+            if not args.yes:
+                print(
+                    json.dumps(
+                        {
+                            "send": False,
+                            "error": f"agent {args.agent} has no session in current PM's main.state",
+                            "fix": f"run `{PROG} sessions create --agent {args.agent}` first, then re-dispatch with --yes",
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+                return
+            eprint(f"agent {args.agent} has no entry in current PM's main.state; auto-creating...")
+            new_ses = create_session(config, "main", config.repo, args.agent)
+            sid = new_ses["id"]
+            ses = new_ses
+            persist_main_session(config, args.agent, new_ses)
+            agent = args.agent
+            wt_path = Path(config.repo).resolve()
+            wt_id = "main"
     else:
         wt_id = args.wt_id
         validate_wt_id(wt_id)
@@ -1968,10 +2096,16 @@ def cmd_session_create(args: argparse.Namespace, config: Config) -> None:
 
     By default idempotent: returns existing non-stale session if one exists.
     Sessions are rebuilt when age exceeds 1 day.  When context exceeds
-    ``MAX_MAIN_SESSION_CONTEXT`` (300K tokens) but the session is younger
+    ``MAX_MAIN_SESSION_CONTEXT`` (350K tokens) but the session is younger
     than 1 day, auto-compact is attempted first (summarize + ping → reuse).
     ``--force`` hard-deletes the existing session and creates a fresh one
     unconditionally.
+
+    If the existing session is reported by the sidecar as ``busy`` or
+    ``streaming`` (another dispatch in flight), the existing session is
+    hard-deleted and a fresh one is created — same effect as ``--force``
+    but auto-detected.  ``unknown`` status (sidecar unreachable / unwatched)
+    is treated as "cannot prove busy → safe to reuse".
     """
     check_services(config)
     agent = args.agent
@@ -1988,27 +2122,32 @@ def cmd_session_create(args: argparse.Namespace, config: Config) -> None:
     if existing_sid and not args.force:
         ses = get_session_by_id(config, existing_sid, directory=directory)
         if ses and not is_session_stale(ses):
-            # Check context bloat — auto-compact if above threshold but session
-            # is fresh (<1d); only rebuild when the session is actually stale.
-            ctx = fetch_session_context(config, existing_sid)
-            if ctx > MAX_MAIN_SESSION_CONTEXT:
-                eprint(f"context exceeded ({ctx // 1000}K > {MAX_MAIN_SESSION_CONTEXT // 1000}K): auto-compacting {agent} {existing_sid}")
-                result = auto_compact_session(config, existing_sid, directory, threshold=_AUTO_COMPACT_THRESHOLD, timeout=_AUTO_COMPACT_HTTP_TIMEOUT)  # type: ignore
-                if result.compacted:
-                    after = fetch_session_context(config, existing_sid)
-                    eprint(f"auto-compact ok: context {ctx // 1000}K → {after // 1000}K; reusing {agent} {existing_sid}")
+            session_status = _get_session_status(config, existing_sid)
+            if session_status in ("busy", "streaming"):
+                eprint(f"existing session {existing_sid} is {session_status}; auto-rebuilding (--force equivalent)...")
+                delete_session(config, existing_sid, hard=True)
+                # fall through to create_session below; do NOT early-return
+                # the existing sid since the busy session is gone.
+            else:
+                ctx = fetch_session_context(config, existing_sid)
+                if ctx > MAX_MAIN_SESSION_CONTEXT:
+                    eprint(f"context exceeded ({ctx // 1000}K > {MAX_MAIN_SESSION_CONTEXT // 1000}K): auto-compacting {agent} {existing_sid}")
+                    result = auto_compact_session(config, existing_sid, directory, threshold=_AUTO_COMPACT_THRESHOLD, timeout=_AUTO_COMPACT_HTTP_TIMEOUT)  # type: ignore
+                    if result.compacted:
+                        after = fetch_session_context(config, existing_sid)
+                        eprint(f"auto-compact ok: context {ctx // 1000}K → {after // 1000}K; reusing {agent} {existing_sid}")
+                        print(json.dumps({"sessionID": existing_sid, "agent": agent, "title": title, "directory": str(directory), "status": "existing"}, ensure_ascii=False))
+                        return
+                    # compact failed — user-initiated rebuild, hard-delete the
+                    # bloated session so the new create_session() starts from a
+                    # clean OpenCode record. A soft delete here would leave a
+                    # tombstoned sid in the main.state and re-prompt the same
+                    # auto-compact path on the next sessions create.
+                    eprint(f"auto-compact failed ({result.error}); rebuilding {agent} {existing_sid} (hard-delete)")
+                    delete_session(config, existing_sid, hard=True)
+                else:
                     print(json.dumps({"sessionID": existing_sid, "agent": agent, "title": title, "directory": str(directory), "status": "existing"}, ensure_ascii=False))
                     return
-                # compact failed — user-initiated rebuild, hard-delete the
-                # bloated session so the new create_session() starts from a
-                # clean OpenCode record. A soft delete here would leave a
-                # tombstoned sid in the main.state and re-prompt the same
-                # auto-compact path on the next sessions create.
-                eprint(f"auto-compact failed ({result.error}); rebuilding {agent} {existing_sid} (hard-delete)")
-                delete_session(config, existing_sid, hard=True)
-            else:
-                print(json.dumps({"sessionID": existing_sid, "agent": agent, "title": title, "directory": str(directory), "status": "existing"}, ensure_ascii=False))
-                return
         elif ses:
             eprint(f"stale session archived: {agent} {existing_sid}")
             delete_session(config, existing_sid)
@@ -2105,6 +2244,35 @@ def persist_main_session(config: Config, agent: str, session: dict[str, Any]) ->
 
 def _warn_deprecated(message: str) -> None:
     eprint(f"DEPRECATED: {message}")
+
+
+def _filter_for_pm_ownership(config: Config, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Keep only sessions whose id appears in the current PM's ``main.state``.
+
+    Per-PM isolation: when ``config.pm_session_id`` is set, ``main.state`` is
+    the source of truth for which main-agent session IDs belong to the
+    current PM conversation.  Without this filter, ``sessions list --main``
+    would scan the full directory and surface other PMs' session IDs.
+
+    - ``config.pm_session_id`` empty → pass through (legacy / no-PM envs).
+    - ``config.pm_session_id`` set + empty main.state → empty list (the
+      current PM owns nothing; show honest empty instead of every PM's
+      sessions).
+    - ``config.pm_session_id`` set + populated main.state → keep only
+      items whose ``id`` matches a ``{agent}_session_id`` field.
+
+    Display-only filter, no side effects.
+    """
+    if not config.pm_session_id:
+        return items
+    main_state = read_main_state(config)
+    owned_sids: set[str] = set()
+    for key, val in main_state.items():
+        if key.endswith("_session_id") and val:
+            owned_sids.add(str(val))
+    if not owned_sids:
+        return []
+    return [it for it in items if str(it.get("id") or "") in owned_sids]
 
 
 def _resolve_sessions_filter(args: argparse.Namespace, config: Config) -> tuple[str, Path]:
@@ -2220,6 +2388,11 @@ def cmd_sessions_list(args: argparse.Namespace, config: Config) -> None:
         )
     wt_id, wt_path = _resolve_sessions_filter(args, config)
     items = _sessions_for_filter(config, wt_id, wt_path, args)
+    # ``--main`` is the only target with a PM dimension; ``--wt``/``--path``
+    # are worktree-scoped and pass through unchanged.  When ``pm_session_id``
+    # is empty, the filter is a no-op (legacy / no-PM environments).
+    if getattr(args, "main", False) and config.pm_session_id:
+        items = _filter_for_pm_ownership(config, items)
     items.sort(key=session_sort_key, reverse=True)
     if args.format == "json":
         print(json.dumps(items, ensure_ascii=False, indent=2))
@@ -3705,7 +3878,7 @@ _IDLE_WATCH_STOP_TIMEOUT_DEFAULT = 3.0
 # last-ditch compact before the next request would be guaranteed to fail;
 # the budget matches what other toolchain scripts use to flag "context is
 # getting expensive".
-_AUTO_COMPACT_THRESHOLD = 300_000
+_AUTO_COMPACT_THRESHOLD = 350_000
 _AUTO_COMPACT_HTTP_TIMEOUT = 60
 
 
@@ -4509,6 +4682,8 @@ def _render_repair_stuck_prompt(wt_id: str, agent: str, branch: str, wt_path: Pa
     lines.append("- pytest / ruff / mypy 查看当前质量")
     lines.append("")
     lines.append("确认已完成部分后，继续完成剩余工作。不要重写已完成的 commits。")
+    lines.append("")
+    lines.append(_hard_constraints())
     return "\n".join(lines)
 
 
@@ -4956,6 +5131,14 @@ Do not use "sessions list --session". For one session, use "session show/status/
     session_dispatch = session_sub.add_parser("dispatch", help="Dispatch a task directly to one session ID.")
     session_dispatch.add_argument("session_id")
     session_dispatch.add_argument("--agent", default=None, help="Optional agent override if session metadata lacks agent.")
+    session_dispatch.add_argument(
+        "--pm-session-id",
+        default=None,
+        help=(
+            "Override the current PM session scope (default: $PM_SESSION_ID or .pm/pm-session-info.json). "
+            "Used for PM session ownership checks (P1-3): dispatch is rejected if --session does not belong to this PM."
+        ),
+    )
     _add_dispatch_options(session_dispatch, allow_session=False)
     session_dispatch.set_defaults(func=cmd_session_dispatch)
 
@@ -4990,9 +5173,14 @@ Right:
     sessions_create.add_argument(
         "--force",
         action="store_true",
-        help="Hard-delete persisted existing session and create a new one. Without --force, stale/oversized sessions are archived/unwatched.",
+        help="Hard-delete persisted existing session and create a new one. Without --force, stale/oversized/busy sessions are auto-rebuilt.",
     )
     sessions_create.add_argument("--directory", default=None, help="Directory for the session. Default: repo root.")
+    sessions_create.add_argument(
+        "--pm-session-id",
+        default=None,
+        help=("Override the current PM session scope (default: $PM_SESSION_ID or .pm/pm-session-info.json). Used for per-PM main.state isolation (P1-3)."),
+    )
     sessions_create.set_defaults(func=cmd_session_create)
 
     sessions_list = sessions_sub.add_parser("list", help="List sessions by --wt/--main/--path filters.")
@@ -5004,6 +5192,11 @@ Right:
     sessions_list.add_argument("--agent")
     sessions_list.add_argument("--agents")
     sessions_list.add_argument("--format", choices=["text", "json"], default="text")
+    sessions_list.add_argument(
+        "--pm-session-id",
+        default=None,
+        help=("Override the current PM session scope (default: $PM_SESSION_ID or .pm/pm-session-info.json). With --main, lists only sessions owned by this PM (P1-3 isolation)."),
+    )
     sessions_list.set_defaults(func=cmd_sessions_list)
 
     sessions_delete = sessions_sub.add_parser("delete", help="Delete/tombstone sessions by --wt/--main/--path filters.")
@@ -5124,6 +5317,13 @@ def main() -> None:
     parser = build_parser()
     args = parser.parse_args()
     config = Config.load()
+    # CLI ``--pm-session-id`` overrides env / JSON file default.  Applied
+    # post-Config.load so the override flows through every Config consumer;
+    # state-file paths in ``_main_state_file`` re-derive on each call.
+    # ``object.__setattr__`` bypasses the frozen-dataclass guard.
+    pm_sid_override = getattr(args, "pm_session_id", None) or env("PM_SESSION_ID", "")
+    if pm_sid_override:
+        object.__setattr__(config, "pm_session_id", pm_sid_override)
     args.func(args, config)
 
 
