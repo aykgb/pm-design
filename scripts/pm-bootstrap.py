@@ -320,6 +320,7 @@ def copy_runtime_scripts(dry_run: bool) -> tuple[int, int]:
         else:
             target_dir.mkdir(parents=True, exist_ok=True)
             import shutil
+
             shutil.copy2(src, dst)
             print(f"   ✅ 复制 runtime → {target_dir.relative_to(PROJECT_ROOT)}/{src.name}")
         copied += 1
@@ -355,6 +356,7 @@ def copy_plugins(dry_run: bool) -> tuple[int, int]:
             print(f"   📄 将复制 plugin: {src.name}")
         else:
             import shutil
+
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
             print(f"   ✅ 复制 plugin: {src.name}")
@@ -366,6 +368,7 @@ def copy_plugins(dry_run: bool) -> tuple[int, int]:
 def _copy_dir(src: Path, dst: Path) -> None:
     """Recursively copy a directory, creating parent dirs."""
     import shutil
+
     dst.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(src, dst)
 
@@ -490,6 +493,7 @@ def main() -> None:
             generated += 1
         else:
             import shutil
+
             opencode_tgt.parent.mkdir(parents=True, exist_ok=True)
             # 占位符替换 (与 generate_file 一致); opencode.json 仅含 {{project_name}} 占位符
             content = opencode_tpl.read_text(encoding="utf-8")
