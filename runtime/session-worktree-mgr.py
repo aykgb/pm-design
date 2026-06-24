@@ -1768,7 +1768,7 @@ def _hard_constraints() -> str:
 - 按 workflow 完成任务——不跳过 Checking / Testing / PR 步骤
 - 修改前先读目标文件和关联文件——禁止对路径/签名/契约做假设
 - 遇到阻塞不绕行——立即报告 blocker 与原因，禁止用 workaround/暂不确定/能跑就行为托词
-- 禁止使用 question 工具——直接报告 blocker，不中断流水线等待交互"""
+"""
 
 
 def render_prompt(wt_dir: Path, task: str, *, config: Config) -> str:
